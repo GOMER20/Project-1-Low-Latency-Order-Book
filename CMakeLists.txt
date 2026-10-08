@@ -120,13 +120,22 @@ if(LOB_BUILD_TESTS)
     tests/matching_test.cpp
     tests/edge_case_test.cpp
     tests/model_test.cpp
-    tests/allocation_test.cpp
     tests/spsc_ring_test.cpp
     tests/matching_engine_test.cpp
     tests/order_type_test.cpp
     tests/thread_affinity_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   gtest_discover_tests(lob_tests)
+
+  # This test replaces global operator new to count allocations. Sanitizer
+  # runtimes replace operator new too, and the two cannot share a binary, so
+  # the test gets an executable of its own and is left out of sanitizer builds.
+  if(NOT LOB_ENABLE_SANITIZERS AND NOT LOB_ENABLE_TSAN)
+    lob_add_executable(lob_allocation_test
+      tests/allocation_test.cpp)
+    target_link_libraries(lob_allocation_test PRIVATE GTest::gtest_main)
+    gtest_discover_tests(lob_allocation_test)
+  endif()
 endif()
 
 # --- Benchmarks --------------------------------------------------------------

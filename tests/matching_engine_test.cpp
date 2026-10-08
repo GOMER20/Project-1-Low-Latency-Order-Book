@@ -46,7 +46,9 @@ bool poll_until_answered(MatchingEngine& engine, std::vector<Event>& events,
   while (answered < target) {
     const std::size_t polled = engine.poll([&](const Event& event) {
       events.push_back(event);
-      answered += answers_a_command(event) ? 1 : 0;
+      if (answers_a_command(event)) {
+        ++answered;
+      }
     });
     if (polled == 0) {
       if (std::chrono::steady_clock::now() > deadline) {
@@ -282,7 +284,11 @@ TEST(EngineThread, StopHandlesEverythingThatWasAlreadyQueued) {
   engine.stop();
 
   std::size_t answered = 0;
-  engine.poll([&](const Event& event) { answered += answers_a_command(event) ? 1 : 0; });
+  engine.poll([&](const Event& event) {
+    if (answers_a_command(event)) {
+      ++answered;
+    }
+  });
   EXPECT_EQ(answered, 50u);
   EXPECT_EQ(engine.commands_processed(), 50u);
   EXPECT_EQ(engine.events_dropped(), 0u);
@@ -383,7 +389,9 @@ TEST(EngineThread, ThreadedRunMatchesRunningByHandUnderBackPressure) {
   const auto poll_once = [&] {
     engine.poll([&](const Event& event) {
       actual.push_back(event);
-      answered += answers_a_command(event) ? 1 : 0;
+      if (answers_a_command(event)) {
+        ++answered;
+      }
     });
   };
 
