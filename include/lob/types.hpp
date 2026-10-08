@@ -15,6 +15,13 @@ inline constexpr OrderId kInvalidOrderId = 0;
 
 enum class Side : std::uint8_t { Buy, Sell };
 
+enum class OrderType : std::uint8_t {
+  Limit,   // trade what it can, then rest the remainder until filled or cancelled
+  Market,  // trade at any price; never rests
+  IOC,     // immediate-or-cancel: trade at the limit price or better; never rests
+  FOK,     // fill-or-kill: trade in full immediately or not at all; never rests
+};
+
 constexpr Side opposite(Side side) noexcept {
   return side == Side::Buy ? Side::Sell : Side::Buy;
 }

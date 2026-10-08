@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 #include "lob/level_bitmap.hpp"
 #include "lob/order_pool.hpp"
@@ -29,7 +30,7 @@ struct BookConfig {
 struct SubmitResult {
   OrderId id;        // kInvalidOrderId if the order was rejected
   Quantity filled;   // quantity that traded immediately
-  Quantity resting;  // quantity left in the book; 0 if fully filled
+  Quantity resting;  // quantity left in the book; always 0 for Market, IOC and FOK
 };
 
 // A limit order book and matching engine for one symbol. All memory is
@@ -51,8 +52,13 @@ class OrderBook {
                 std::min(config.symbol.size(), sizeof(symbol_)), symbol_);
   }
 
-  // Matches an incoming limit order against the opposite side of the book,
-  // then rests whatever is left at its limit price.
+  // Matches an incoming order against the opposite side of the book. What
+  // happens to any quantity left over depends on `type`:
+  //
+  //   Limit   rests at its limit price until it is filled or cancelled
+  //   Market  trades at any price; the remainder is discarded; `price` is ignored
+  //   IOC     trades at its limit price or better; the remainder is discarded
+  //   FOK     trades in full immediately, or does not trade at all
   //
   // Price-time priority: the best-priced level trades first, and within a
   // level the oldest order trades first. Every fill happens at the resting
@@ -61,59 +67,62 @@ class OrderBook {
   // `on_trade` is called once per fill, after the book has been updated for
   // that fill. It must not throw and must not call back into the book.
   //
-  // The order is rejected (id == kInvalidOrderId, no trades) if the price is
-  // outside the book's range, the quantity is zero, or the book is full.
+  // The order is rejected (id == kInvalidOrderId, no trades) if the quantity
+  // is zero, if its price is outside the book's range (a Market order has no
+  // price to check) or, for Limit orders only, if the book is full. Market,
+  // IOC and FOK orders never rest, so they need no room in the book.
+  //
+  // A FOK order that cannot be filled in full is not a rejection: it gets an
+  // ID and reports zero filled.
+  template <std::invocable<const Trade&> OnTrade>
+  [[nodiscard]] SubmitResult submit(Side side, Price price, Quantity quantity, OrderType type,
+                                    OnTrade&& on_trade) noexcept {
+    if (quantity == 0) [[unlikely]] {
+      return {kInvalidOrderId, 0, 0};
+    }
+    std::size_t limit_level;
+    if (type == OrderType::Market) {
+      // The most aggressive level there is: a buy will pay the highest price.
+      limit_level = side == Side::Buy ? num_levels_ - 1 : 0;
+    } else {
+      limit_level = level_of(price);
+      if (limit_level >= num_levels_) [[unlikely]] {
+        return {kInvalidOrderId, 0, 0};
+      }
+    }
+
+    if (type == OrderType::Limit) {
+      // The slot is reserved before matching so that the ID reported in the
+      // trades is the same ID the remainder rests under.
+      const OrderIndex index = pool_.allocate();
+      if (index == kNullIndex) [[unlikely]] {
+        return {kInvalidOrderId, 0, 0};
+      }
+      const OrderId id = next_id(index);
+      const Quantity remaining = match(side, limit_level, quantity, id, on_trade);
+      if (remaining == 0) {
+        pool_.deallocate(index);  // fully filled: nothing to rest
+      } else {
+        rest(index, id, side, price, limit_level, remaining);
+      }
+      return {id, quantity - remaining, remaining};
+    }
+
+    // An order that never rests needs no slot. Its ID carries kNullIndex where
+    // the slot would be, so it can never be mistaken for a live order.
+    const OrderId id = next_id(kNullIndex);
+    if (type == OrderType::FOK && !can_fill(side, limit_level, quantity)) {
+      return {id, 0, 0};
+    }
+    const Quantity remaining = match(side, limit_level, quantity, id, on_trade);
+    return {id, quantity - remaining, 0};
+  }
+
+  // A Limit order: the same as submit() above with OrderType::Limit.
   template <std::invocable<const Trade&> OnTrade>
   [[nodiscard]] SubmitResult submit(Side side, Price price, Quantity quantity,
                                     OnTrade&& on_trade) noexcept {
-    const std::size_t limit_level = level_of(price);
-    if (limit_level >= num_levels_ || quantity == 0) [[unlikely]] {
-      return {kInvalidOrderId, 0, 0};
-    }
-    // The slot is reserved before matching so that the ID reported in the
-    // trades is the same ID the remainder rests under.
-    const OrderIndex index = pool_.allocate();
-    if (index == kNullIndex) [[unlikely]] {
-      return {kInvalidOrderId, 0, 0};
-    }
-    const OrderId id = next_id(index);
-
-    const Side maker_side = opposite(side);
-    BookSide& makers = sides_[side_index(maker_side)];
-    Quantity remaining = quantity;
-
-    while (remaining != 0) {
-      const std::size_t level = best_level(maker_side);
-      if (level == LevelBitmap::npos) {
-        break;
-      }
-      const bool crosses = side == Side::Buy ? level <= limit_level : level >= limit_level;
-      if (!crosses) {
-        break;
-      }
-
-      PriceLevel& price_level = makers.levels[level];
-      const Price trade_price = min_price_ + static_cast<Price>(level);
-      do {
-        Order& maker = pool_[price_level.head];
-        const OrderId maker_id = maker.id;
-        const Quantity fill = std::min(remaining, maker.quantity);
-        if (fill == maker.quantity) {
-          remove(maker);
-        } else {
-          price_level.reduce(maker, fill);
-        }
-        remaining -= fill;
-        on_trade(make_trade(maker_id, id, trade_price, fill, side));
-      } while (remaining != 0 && !price_level.empty());
-    }
-
-    if (remaining == 0) {
-      pool_.deallocate(index);  // fully filled: nothing to rest
-    } else {
-      rest(index, id, side, price, limit_level, remaining);
-    }
-    return {id, quantity - remaining, remaining};
+    return submit(side, price, quantity, OrderType::Limit, std::forward<OnTrade>(on_trade));
   }
 
   // Rests a new order at the back of the queue for its price WITHOUT matching
@@ -247,6 +256,66 @@ class OrderBook {
   [[nodiscard]] std::size_t best_level(Side side) const noexcept {
     const LevelBitmap& occupied = sides_[side_index(side)].occupied;
     return side == Side::Buy ? occupied.find_last() : occupied.find_first();
+  }
+
+  // Whether an incoming order limited to `limit_level` may trade at `level`.
+  static constexpr bool crosses(Side taker_side, std::size_t level,
+                                std::size_t limit_level) noexcept {
+    return taker_side == Side::Buy ? level <= limit_level : level >= limit_level;
+  }
+
+  // Trades an incoming order against the opposite side, best price first and
+  // oldest order first, until it is filled or nothing is left at
+  // `limit_level` or better. Returns the quantity that did not trade.
+  template <typename OnTrade>
+  Quantity match(Side side, std::size_t limit_level, Quantity quantity, OrderId taker_id,
+                 OnTrade& on_trade) noexcept {
+    const Side maker_side = opposite(side);
+    BookSide& makers = sides_[side_index(maker_side)];
+    Quantity remaining = quantity;
+
+    while (remaining != 0) {
+      const std::size_t level = best_level(maker_side);
+      if (level == LevelBitmap::npos || !crosses(side, level, limit_level)) {
+        break;
+      }
+
+      PriceLevel& price_level = makers.levels[level];
+      const Price trade_price = min_price_ + static_cast<Price>(level);
+      do {
+        Order& maker = pool_[price_level.head];
+        const OrderId maker_id = maker.id;
+        const Quantity fill = std::min(remaining, maker.quantity);
+        if (fill == maker.quantity) {
+          remove(maker);
+        } else {
+          price_level.reduce(maker, fill);
+        }
+        remaining -= fill;
+        on_trade(make_trade(maker_id, taker_id, trade_price, fill, side));
+      } while (remaining != 0 && !price_level.empty());
+    }
+    return remaining;
+  }
+
+  // True if at least `quantity` rests on the opposite side at `limit_level`
+  // or better. It adds up each level's running total and hops between
+  // occupied levels with the bitmap, so it never walks a queue of orders.
+  [[nodiscard]] bool can_fill(Side side, std::size_t limit_level,
+                              Quantity quantity) const noexcept {
+    const Side maker_side = opposite(side);
+    const BookSide& makers = sides_[side_index(maker_side)];
+    std::uint64_t available = 0;
+    std::size_t level = best_level(maker_side);
+    while (level != LevelBitmap::npos && crosses(side, level, limit_level)) {
+      available += makers.levels[level].total_quantity;
+      if (available >= quantity) {
+        return true;
+      }
+      level = maker_side == Side::Sell ? makers.occupied.find_next(level)
+                                       : makers.occupied.find_prev(level);
+    }
+    return false;
   }
 
   [[nodiscard]] Order* lookup(OrderId id) noexcept {

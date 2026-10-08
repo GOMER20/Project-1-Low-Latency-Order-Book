@@ -12,8 +12,11 @@
 #include "lob/messages.hpp"
 #include "lob/order_book.hpp"
 #include "lob/spsc_ring.hpp"
+#include "lob/thread_affinity.hpp"
 
 namespace lob {
+
+inline constexpr int kNoPinning = -1;
 
 enum class IdleStrategy : std::uint8_t {
   Spin,   // busy-wait for the next command: lowest latency, occupies a whole core
@@ -25,6 +28,7 @@ struct EngineConfig {
   std::size_t command_capacity = 1 << 16;  // inbound ring; rounded up to a power of two
   std::size_t event_capacity = 1 << 16;    // outbound ring; rounded up to a power of two
   IdleStrategy idle = IdleStrategy::Spin;
+  int pin_to_cpu = kNoPinning;             // CPU to bind the engine thread to (Linux only)
 };
 
 // An order book running on its own thread, fed and read through two SPSC rings:
@@ -52,7 +56,8 @@ class MatchingEngine {
       : book_(config.book),
         commands_(config.command_capacity),
         events_(config.event_capacity),
-        idle_(config.idle) {}
+        idle_(config.idle),
+        pin_to_cpu_(config.pin_to_cpu) {}
 
   ~MatchingEngine() { stop(); }
 
@@ -61,10 +66,17 @@ class MatchingEngine {
 
   // --- Controlling thread ----------------------------------------------------
 
+  // Returns once the engine thread is up, so pinned() can be trusted from
+  // then on.
   void start() {
     assert(!thread_.joinable());
     stop_requested_.store(false, std::memory_order_release);
+    started_.store(false, std::memory_order_release);
+    pinned_.store(false, std::memory_order_release);
     thread_ = std::thread([this] { run(); });
+    while (!started_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
   }
 
   // Processes every command that was queued before the call, then joins the
@@ -79,18 +91,24 @@ class MatchingEngine {
 
   [[nodiscard]] bool running() const noexcept { return thread_.joinable(); }
 
+  // Whether the engine thread is bound to the CPU asked for in the config.
+  // False if no CPU was asked for, or if the request could not be honoured;
+  // the engine runs either way, so check this if pinning matters to you.
+  [[nodiscard]] bool pinned() const noexcept { return pinned_.load(std::memory_order_acquire); }
+
   // --- Gateway thread --------------------------------------------------------
   // Both return false if the command ring is full; the caller decides whether
   // to retry.
 
-  [[nodiscard]] bool submit(std::uint64_t client_tag, Side side, Price price,
-                            Quantity quantity) noexcept {
+  [[nodiscard]] bool submit(std::uint64_t client_tag, Side side, Price price, Quantity quantity,
+                            OrderType order_type = OrderType::Limit) noexcept {
     Command command{};
     command.client_tag = client_tag;
     command.price = price;
     command.quantity = quantity;
     command.side = side;
     command.type = CommandType::Submit;
+    command.order_type = order_type;
     return commands_.try_push(command);
   }
 
@@ -142,6 +160,11 @@ class MatchingEngine {
 
  private:
   void run() noexcept {
+    if (pin_to_cpu_ != kNoPinning) {
+      pinned_.store(pin_current_thread_to_cpu(pin_to_cpu_), std::memory_order_release);
+    }
+    started_.store(true, std::memory_order_release);
+
     while (!stop_requested_.load(std::memory_order_acquire)) {
       if (process_pending() == 0) {
         if (idle_ == IdleStrategy::Yield) {
@@ -160,7 +183,8 @@ class MatchingEngine {
 
     if (command.type == CommandType::Submit) {
       const SubmitResult result = book_.submit(
-          command.side, command.price, command.quantity, [&](const Trade& trade) {
+          command.side, command.price, command.quantity, command.order_type,
+          [&](const Trade& trade) {
             Event fill{};
             fill.client_tag = command.client_tag;
             fill.order_id = trade.taker_id;
@@ -200,9 +224,12 @@ class MatchingEngine {
   SpscRing<Command> commands_;
   SpscRing<Event> events_;
   IdleStrategy idle_;
+  int pin_to_cpu_;
 
   // True whenever the engine thread should not be (or is not) running.
   alignas(kCacheLineSize) std::atomic<bool> stop_requested_{true};
+  std::atomic<bool> started_{false};
+  std::atomic<bool> pinned_{false};
   std::atomic<std::uint64_t> commands_processed_{0};
   std::atomic<std::uint64_t> events_dropped_{0};
 

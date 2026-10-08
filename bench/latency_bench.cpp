@@ -53,10 +53,11 @@ lob::SubmitResult submit_passive(OrderBook& book, std::uint64_t random) {
 }
 
 // An incoming order priced to trade with exactly one resting order.
-lob::SubmitResult submit_aggressive(OrderBook& book, std::uint64_t random) {
+lob::SubmitResult submit_aggressive(OrderBook& book, std::uint64_t random,
+                                    lob::OrderType type = lob::OrderType::Limit) {
   const bool buy = (random & 1) != 0;
   return book.submit(buy ? Side::Buy : Side::Sell, buy ? kMid + kDepth : kMid - kDepth, kLot,
-                     kIgnoreTrades);
+                     type, kIgnoreTrades);
 }
 
 // Tops the book up to 2 * kResting orders and shuffles the IDs, so later
@@ -123,7 +124,7 @@ BENCHMARK(BM_Cancel_DeepBook);
 
 // One incoming order that crosses the spread and fully fills one resting
 // order, against a book holding 65k-131k orders.
-void BM_Match_DeepBook(benchmark::State& state) {
+void match_one_order(benchmark::State& state, lob::OrderType type) {
   OrderBook book(kConfig);
   Rng rng;
   const auto top_up = [&] {
@@ -139,11 +140,26 @@ void BM_Match_DeepBook(benchmark::State& state) {
       top_up();
       state.ResumeTiming();
     }
-    lob::SubmitResult result = submit_aggressive(book, rng());
+    lob::SubmitResult result = submit_aggressive(book, rng(), type);
     benchmark::DoNotOptimize(result);
   }
 }
+
+void BM_Match_DeepBook(benchmark::State& state) { match_one_order(state, lob::OrderType::Limit); }
 BENCHMARK(BM_Match_DeepBook);
+
+// The same fill by the order types that never rest. They skip reserving a
+// slot; fill-or-kill adds its check that enough quantity is available.
+void BM_MatchMarket_DeepBook(benchmark::State& state) {
+  match_one_order(state, lob::OrderType::Market);
+}
+BENCHMARK(BM_MatchMarket_DeepBook);
+
+void BM_MatchIoc_DeepBook(benchmark::State& state) { match_one_order(state, lob::OrderType::IOC); }
+BENCHMARK(BM_MatchIoc_DeepBook);
+
+void BM_MatchFok_DeepBook(benchmark::State& state) { match_one_order(state, lob::OrderType::FOK); }
+BENCHMARK(BM_MatchFok_DeepBook);
 
 // A steady-state mix of order flow on a deep book: 48% new resting orders,
 // 48% cancels of a randomly chosen order, 4% incoming orders that trade.

@@ -17,6 +17,7 @@ struct Command {
   Quantity quantity;         // Submit: order quantity
   Side side;                 // Submit
   CommandType type;
+  OrderType order_type;      // Submit: Limit, Market, IOC or FOK
 };
 
 static_assert(sizeof(Command) == 32);
@@ -35,6 +36,9 @@ enum class EventType : std::uint8_t {
 // Every command produces exactly one of Accepted, Rejected, Cancelled or
 // CancelRejected. A Submit that trades produces its Trade events first and its
 // Accepted last, so the Accepted event also marks the end of the command.
+//
+// Market, IOC and FOK orders never rest, so their Accepted event always has
+// `resting` equal to zero: whatever they did not fill was discarded.
 //
 // Fields that do not apply to an event's type are zero.
 struct Event {

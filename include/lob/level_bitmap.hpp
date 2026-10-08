@@ -68,9 +68,63 @@ class LevelBitmap {
     return (leaf_word << 6) | highest(leaf_[leaf_word]);
   }
 
+  // Lowest set bit strictly above `bit`, or npos. Like find_first, it never
+  // scans: at most one word is examined in each tier on the way up, and one
+  // in each tier on the way back down.
+  [[nodiscard]] std::size_t find_next(std::size_t bit) const noexcept {
+    std::size_t leaf_word = bit >> 6;
+    std::uint64_t word = leaf_[leaf_word] & above(bit);
+    if (word != 0) {
+      return (leaf_word << 6) | lowest(word);
+    }
+    std::size_t mid_word = leaf_word >> 6;
+    word = mid_[mid_word] & above(leaf_word);
+    if (word == 0) {
+      word = top_ & above(mid_word);
+      if (word == 0) {
+        return npos;
+      }
+      mid_word = lowest(word);
+      word = mid_[mid_word];
+    }
+    leaf_word = (mid_word << 6) | lowest(word);
+    return (leaf_word << 6) | lowest(leaf_[leaf_word]);
+  }
+
+  // Highest set bit strictly below `bit`, or npos.
+  [[nodiscard]] std::size_t find_prev(std::size_t bit) const noexcept {
+    std::size_t leaf_word = bit >> 6;
+    std::uint64_t word = leaf_[leaf_word] & below(bit);
+    if (word != 0) {
+      return (leaf_word << 6) | highest(word);
+    }
+    std::size_t mid_word = leaf_word >> 6;
+    word = mid_[mid_word] & below(leaf_word);
+    if (word == 0) {
+      word = top_ & below(mid_word);
+      if (word == 0) {
+        return npos;
+      }
+      mid_word = highest(word);
+      word = mid_[mid_word];
+    }
+    leaf_word = (mid_word << 6) | highest(word);
+    return (leaf_word << 6) | highest(leaf_[leaf_word]);
+  }
+
  private:
   static constexpr std::uint64_t mask(std::size_t bit) noexcept {
     return std::uint64_t{1} << (bit & 63);
+  }
+
+  // The bits of a word above / below position (index & 63), exclusive. The
+  // shift is split in two so that position 63 does not shift by 64.
+  static constexpr std::uint64_t above(std::size_t index) noexcept {
+    return (~std::uint64_t{0} << (index & 63)) << 1;
+  }
+
+  static constexpr std::uint64_t below(std::size_t index) noexcept {
+    return mask(index) - 1;
   }
 
   // std::countr_zero / std::countl_zero are the C++20 spellings of
