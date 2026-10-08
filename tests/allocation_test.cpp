@@ -16,10 +16,7 @@ namespace {
 
 std::atomic<std::size_t> g_allocations{0};
 
-}  // namespace
-
-// The array, nothrow and sized forms all forward to these by default.
-void* operator new(std::size_t size) {
+void* counted_allocate(std::size_t size) {
   g_allocations.fetch_add(1, std::memory_order_relaxed);
   if (void* memory = std::malloc(size != 0 ? size : 1)) {
     return memory;
@@ -27,7 +24,7 @@ void* operator new(std::size_t size) {
   throw std::bad_alloc();
 }
 
-void* operator new(std::size_t size, std::align_val_t alignment) {
+void* counted_allocate(std::size_t size, std::align_val_t alignment) {
   g_allocations.fetch_add(1, std::memory_order_relaxed);
   void* memory = nullptr;
   if (posix_memalign(&memory, static_cast<std::size_t>(alignment), size != 0 ? size : 1) == 0) {
@@ -36,10 +33,28 @@ void* operator new(std::size_t size, std::align_val_t alignment) {
   throw std::bad_alloc();
 }
 
+}  // namespace
+
+// Every form the engine can reach is replaced explicitly. Relying on the
+// array forms to forward to the scalar ones is not enough: sanitizer runtimes
+// supply their own array forms, which would bypass the counter.
+void* operator new(std::size_t size) { return counted_allocate(size); }
+void* operator new[](std::size_t size) { return counted_allocate(size); }
+void* operator new(std::size_t size, std::align_val_t alignment) {
+  return counted_allocate(size, alignment);
+}
+void* operator new[](std::size_t size, std::align_val_t alignment) {
+  return counted_allocate(size, alignment);
+}
+
 void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
 void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 void operator delete(void* memory, std::align_val_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::align_val_t) noexcept { std::free(memory); }
 void operator delete(void* memory, std::size_t, std::align_val_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept { std::free(memory); }
 
 namespace {
 

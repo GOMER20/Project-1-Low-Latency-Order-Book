@@ -24,6 +24,7 @@ option(LOB_BUILD_BENCHMARKS   "Build the Google Benchmark suite"           ON)
 option(LOB_NATIVE_ARCH        "Tune for the host CPU (-march=native)"      ON)
 option(LOB_ENABLE_LTO         "Link-time optimisation in Release builds"   ON)
 option(LOB_ENABLE_SANITIZERS  "Build with ASan + UBSan (use with Debug)"   OFF)
+option(LOB_ENABLE_TSAN        "Build with ThreadSanitizer (use with Debug)" OFF)
 option(LOB_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"          OFF)
 
 # --- Flags shared by every first-party target --------------------------------
@@ -54,6 +55,16 @@ if(LOB_ENABLE_SANITIZERS)
   target_link_options(lob_flags INTERFACE -fsanitize=address,undefined)
 endif()
 
+# ThreadSanitizer checks the SPSC ring's memory ordering. It cannot share a
+# binary with AddressSanitizer.
+if(LOB_ENABLE_TSAN)
+  if(LOB_ENABLE_SANITIZERS)
+    message(FATAL_ERROR "LOB_ENABLE_TSAN and LOB_ENABLE_SANITIZERS cannot be combined")
+  endif()
+  target_compile_options(lob_flags INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
+  target_link_options(lob_flags INTERFACE -fsanitize=thread)
+endif()
+
 if(LOB_ENABLE_LTO)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT LOB_IPO_SUPPORTED OUTPUT LOB_IPO_MESSAGE)
@@ -72,7 +83,7 @@ target_link_libraries(lob INTERFACE lob_flags)
 
 function(lob_add_executable name)
   add_executable(${name} ${ARGN})
-  target_link_libraries(${name} PRIVATE lob::lob)
+  target_link_libraries(${name} PRIVATE lob::lob Threads::Threads)
   if(LOB_ENABLE_LTO AND LOB_IPO_SUPPORTED)
     set_property(TARGET ${name} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
   endif()
@@ -81,6 +92,7 @@ endfunction()
 # --- Dependencies ------------------------------------------------------------
 # Prefer system packages (apt/brew); fall back to a pinned source download.
 include(FetchContent)
+find_package(Threads REQUIRED)
 
 # --- Tests -------------------------------------------------------------------
 if(LOB_BUILD_TESTS)
@@ -108,7 +120,8 @@ if(LOB_BUILD_TESTS)
     tests/matching_test.cpp
     tests/edge_case_test.cpp
     tests/model_test.cpp
-    tests/allocation_test.cpp)
+    tests/allocation_test.cpp
+    tests/spsc_ring_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   gtest_discover_tests(lob_tests)
 endif()
@@ -134,6 +147,7 @@ if(LOB_BUILD_BENCHMARKS)
     bench/matching_bench.cpp
     bench/order_book_bench.cpp
     bench/price_level_bench.cpp
-    bench/order_pool_bench.cpp)
+    bench/order_pool_bench.cpp
+    bench/spsc_ring_bench.cpp)
   target_link_libraries(lob_bench PRIVATE benchmark::benchmark_main)
 endif()

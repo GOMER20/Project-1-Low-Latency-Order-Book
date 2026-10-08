@@ -1,7 +1,18 @@
 # Project 1 — Low-Latency Limit Order Book Matching Engine
 
-A single-threaded limit order book and matching engine in C++20. It matches by
-price-time priority and never touches the heap after start-up.
+A limit order book is the data structure at the heart of an exchange. It holds
+every resting buy and sell order for an instrument, and when a new order
+arrives it matches it against the best-priced orders on the other side, oldest
+first at each price. That rule is called price-time priority.
+
+"Low latency" means doing that in tens of nanoseconds, every time. This C++20
+implementation gets there by removing the things that make latency
+unpredictable: it never allocates memory after start-up, never searches for an
+order or a price, and keeps each order in a single CPU cache line. On a laptop
+it inserts, cancels or matches an order in about 20 ns.
+
+The book itself is single-threaded. A lock-free ring buffer is included for
+passing orders in and trades out to other threads without ever blocking it.
 
 ## Design
 
@@ -13,6 +24,7 @@ price-time priority and never touches the heap after start-up.
 | `LevelBitmap` | [include/lob/level_bitmap.hpp](include/lob/level_bitmap.hpp) | One bit per price level in three tiers. Finds the best price among 262,144 levels with three count-zero instructions, however sparse the book. |
 | `OrderBook` | [include/lob/order_book.hpp](include/lob/order_book.hpp) | Flat array of levels per side, indexed by `price - min_price`. Implements `submit` (match, then rest), `add`, `cancel` and `execute`. |
 | `Trade` | [include/lob/trade.hpp](include/lob/trade.hpp) | The 40-byte event emitted for every fill. |
+| `SpscRing` | [include/lob/spsc_ring.hpp](include/lob/spsc_ring.hpp) | A wait-free queue between one producer thread and one consumer thread. Each side's counter has its own cache line, and each side caches the other's counter so it rarely reads it. |
 
 Design rules followed throughout:
 
@@ -44,6 +56,21 @@ book.cancel(ask.id);  // cancels the remaining 60
 
 `submit` returns the order's ID, the quantity filled immediately and the quantity
 left resting. An ID of `lob::kInvalidOrderId` means the order was rejected.
+
+To hand trades to another thread without blocking the book, push them into a
+ring:
+
+```cpp
+#include "lob/spsc_ring.hpp"
+
+lob::SpscRing<lob::Trade> trades(1 << 16);  // capacity rounds up to a power of two
+
+// Matching thread: try_push returns false if the ring is full.
+const auto on_trade = [&](const lob::Trade& trade) { (void)trades.try_push(trade); };
+
+// Publishing thread: take everything that has arrived so far.
+trades.drain([](const lob::Trade& trade) { /* send it */ });
+```
 
 ## Build
 
@@ -77,6 +104,13 @@ cmake -S . -B build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLOB_ENABLE_SANITIZ
 cmake --build build-debug && ctest --test-dir build-debug --output-on-failure
 ```
 
+Debug build with ThreadSanitizer, which checks the ring buffer's memory ordering:
+
+```bash
+cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLOB_ENABLE_TSAN=ON
+cmake --build build-tsan && ctest --test-dir build-tsan --output-on-failure
+```
+
 ## Tests
 
 | File | Covers |
@@ -89,6 +123,7 @@ cmake --build build-debug && ctest --test-dir build-debug --output-on-failure
 | [tests/edge_case_test.cpp](tests/edge_case_test.cpp) | Partial fills, queue jumping, full cancellations, crossing the spread. |
 | [tests/model_test.cpp](tests/model_test.cpp) | 66,000 random operations compared step by step against a naive `std::map` reference book. |
 | [tests/allocation_test.cpp](tests/allocation_test.cpp) | Replaces global `operator new` and asserts that nothing allocates after construction. |
+| [tests/spsc_ring_test.cpp](tests/spsc_ring_test.cpp) | FIFO order, full and empty, wrap-around, and two-thread transfers that check nothing is lost, reordered or torn. |
 
 ## Benchmarks
 
@@ -112,6 +147,7 @@ To run only the headline numbers:
 | `BM_Match_SweepLevels/N` | One order sweeping N price levels; see `items_per_second`. |
 | `BM_OrderPool_*`, `BM_Heap_NewDelete` | The pool against `new` / `delete`. |
 | `BM_IntrusiveLevel_*`, `BM_StdList_*` | The intrusive queue against `std::list`. |
+| `BM_SpscRing_TwoThreads`, `BM_MutexRing_TwoThreads` | Time per `Trade` delivered from one thread to another, through the ring and through the same ring guarded by a mutex. |
 
 The deep-book benchmarks shuffle their orders first, so resting orders and free
 slots are scattered through memory rather than laid out in insertion order.
@@ -132,13 +168,15 @@ with other programs running: no core isolation, no pinning.
 | `BM_Match_SweepLevels/64` | 1,320 ns for 64 rests and 64 fills, about 21 ns per order |
 | `BM_OrderPool_AllocateDeallocate` vs `BM_Heap_NewDelete` | 1.22 ns vs 181 ns |
 | `BM_IntrusiveLevel_AddCancel` vs `BM_StdList_AddCancel` | 2.33 ns vs 197 ns |
+| `BM_SpscRing_TwoThreads` vs `BM_MutexRing_TwoThreads` | 2.5 ns vs 106 ns per event (about 400 million vs 9 million events per second) |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
 
 ## Limits and trade-offs
 
-- **One symbol per book, one thread per book.** There are no locks or atomics.
+- **One symbol per book, one thread per book.** The book has no locks or atomics.
+- **The ring buffer is strictly one producer and one consumer.** A second thread on either side is a data race. It carries trivially copyable types only.
 - **The price range is fixed at construction** and holds at most 262,144 levels. Orders outside it are rejected.
 - **Limit orders only.** There are no market, IOC or FOK orders and no self-trade prevention.
 - **A full book rejects every new order**, including one that would have traded, because a slot is reserved before matching.
@@ -154,7 +192,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 4 — `OrderBook` with `add`, `cancel`, `execute`
 - [x] Phase 5 — Price-time priority matching and `Trade` events
 - [x] Phase 6 — Edge-case tests and latency benchmarks
-- [ ] Next — Lock-free SPSC ring buffers and an engine thread between them
+- [x] Phase 7 — Lock-free SPSC ring buffer
+- [ ] Next — An engine thread that reads orders from one ring and writes trades to another
 
 ## Layout
 
