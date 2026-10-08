@@ -1,6 +1,10 @@
 // Proves the central claim of the design: once a book is constructed, no
 // operation on it touches the heap. Global operator new is replaced with a
-// counting version for this test binary.
+// counting version.
+//
+// That replacement applies to the whole program, so this file is built into
+// a test binary of its own. It is left out of sanitizer builds, because the
+// sanitizer runtimes replace operator new themselves.
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -35,9 +39,8 @@ void* counted_allocate(std::size_t size, std::align_val_t alignment) {
 
 }  // namespace
 
-// Every form the engine can reach is replaced explicitly. Relying on the
-// array forms to forward to the scalar ones is not enough: sanitizer runtimes
-// supply their own array forms, which would bypass the counter.
+// Every form the engine can reach is replaced explicitly, rather than relying
+// on the array forms to forward to the scalar ones.
 void* operator new(std::size_t size) { return counted_allocate(size); }
 void* operator new[](std::size_t size) { return counted_allocate(size); }
 void* operator new(std::size_t size, std::align_val_t alignment) {

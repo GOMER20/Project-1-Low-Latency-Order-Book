@@ -192,7 +192,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/matching_test.cpp](tests/matching_test.cpp) | Price priority, time priority, trade prices, remainders. |
 | [tests/edge_case_test.cpp](tests/edge_case_test.cpp) | Partial fills, queue jumping, full cancellations, crossing the spread. |
 | [tests/model_test.cpp](tests/model_test.cpp) | 66,000 random operations, covering all four order types, compared step by step against a naive `std::map` reference book. |
-| [tests/allocation_test.cpp](tests/allocation_test.cpp) | Replaces global `operator new` and asserts that nothing allocates after construction. |
+| [tests/allocation_test.cpp](tests/allocation_test.cpp) | Replaces global `operator new` and asserts that nothing allocates after construction. Built as its own binary and left out of sanitizer builds, whose runtimes replace `operator new` themselves. |
 | [tests/spsc_ring_test.cpp](tests/spsc_ring_test.cpp) | FIFO order, full and empty, wrap-around, and two-thread transfers that check nothing is lost, reordered or torn. |
 | [tests/matching_engine_test.cpp](tests/matching_engine_test.cpp) | Every event type, start, stop and restart, shutdown with nobody reading, and 5,000 random commands through 4-slot rings compared event for event against a single-threaded run. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
