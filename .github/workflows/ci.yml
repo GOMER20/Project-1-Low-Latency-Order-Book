@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GoogleTest and Google Benchmark come from apt here, exactly as the
+          # README tells a Linux user to install them.
+          - name: Linux, GCC, Release, system packages
+            os: ubuntu-latest
+            cxx: g++
+            build_type: Release
+            system_packages: true
+
+          # Every other job lets CMake download the pinned versions.
+          - name: Linux, Clang, Release
+            os: ubuntu-latest
+            cxx: clang++
+            build_type: Release
+
+          - name: Linux, GCC, ASan + UBSan
+            os: ubuntu-latest
+            cxx: g++
+            build_type: Debug
+            cmake_args: -DLOB_ENABLE_SANITIZERS=ON -DLOB_BUILD_BENCHMARKS=OFF
+
+          - name: Linux, Clang, ThreadSanitizer
+            os: ubuntu-latest
+            cxx: clang++
+            build_type: Debug
+            cmake_args: -DLOB_ENABLE_TSAN=ON -DLOB_BUILD_BENCHMARKS=OFF
+
+          - name: macOS, Apple Clang, Release
+            os: macos-latest
+            cxx: clang++
+            build_type: Release
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install GoogleTest and Google Benchmark from apt
+        if: matrix.system_packages
+        run: sudo apt-get install -y libgtest-dev libbenchmark-dev
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      # Sanitizers need a predictable address-space layout; newer kernels
+      # randomise more bits than older sanitizer runtimes can handle.
+      - name: Reduce address-space randomisation for the sanitizers
+        if: runner.os == 'Linux'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # A very short run of every benchmark, to prove they still build and
+      # run. Timings from shared CI machines mean nothing.
+      - name: Smoke-run the benchmarks
+        if: matrix.build_type == 'Release'
+        timeout-minutes: 5
+        run: ./build/lob_bench --benchmark_min_time=0.01s
