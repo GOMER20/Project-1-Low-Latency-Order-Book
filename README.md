@@ -11,8 +11,9 @@ unpredictable: it never allocates memory after start-up, never searches for an
 order or a price, and keeps each order in a single CPU cache line. On a laptop
 it inserts, cancels or matches an order in about 20 ns.
 
-The book itself is single-threaded. A lock-free ring buffer is included for
-passing orders in and trades out to other threads without ever blocking it.
+The book itself is single-threaded. `MatchingEngine` runs it on a thread of its
+own, taking orders in and sending trades out through lock-free ring buffers, so
+no other thread can ever block it.
 
 ## Design
 
@@ -25,6 +26,8 @@ passing orders in and trades out to other threads without ever blocking it.
 | `OrderBook` | [include/lob/order_book.hpp](include/lob/order_book.hpp) | Flat array of levels per side, indexed by `price - min_price`. Implements `submit` (match, then rest), `add`, `cancel` and `execute`. |
 | `Trade` | [include/lob/trade.hpp](include/lob/trade.hpp) | The 40-byte event emitted for every fill. |
 | `SpscRing` | [include/lob/spsc_ring.hpp](include/lob/spsc_ring.hpp) | A wait-free queue between one producer thread and one consumer thread. Each side's counter has its own cache line, and each side caches the other's counter so it rarely reads it. |
+| `Command`, `Event` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings. |
+| `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | An `OrderBook` on its own thread, between a command ring and an event ring. |
 
 Design rules followed throughout:
 
@@ -57,20 +60,40 @@ book.cancel(ask.id);  // cancels the remaining 60
 `submit` returns the order's ID, the quantity filled immediately and the quantity
 left resting. An ID of `lob::kInvalidOrderId` means the order was rejected.
 
-To hand trades to another thread without blocking the book, push them into a
-ring:
+### Running the book on its own thread
+
+`MatchingEngine` owns a book and a thread. One thread sends it commands, and one
+thread (the same or another) reads the events that come back:
 
 ```cpp
-#include "lob/spsc_ring.hpp"
+#include "lob/matching_engine.hpp"
 
-lob::SpscRing<lob::Trade> trades(1 << 16);  // capacity rounds up to a power of two
+lob::MatchingEngine engine({.book = {.symbol = "AAPL",
+                                     .min_price = 10'000,
+                                     .num_levels = 20'000,
+                                     .max_orders = 1 << 20}});
+engine.start();
 
-// Matching thread: try_push returns false if the ring is full.
-const auto on_trade = [&](const lob::Trade& trade) { (void)trades.try_push(trade); };
+// Gateway thread. The tag (here 1) comes back on every event this order causes.
+// submit and cancel return false if the command ring is full.
+while (!engine.submit(1, lob::Side::Buy, 15'000, 100)) {
+}
 
-// Publishing thread: take everything that has arrived so far.
-trades.drain([](const lob::Trade& trade) { /* send it */ });
+// Publisher thread: everything the engine has reported so far, in order.
+engine.poll([&](const lob::Event& event) {
+  // event.type is Accepted, Rejected, Trade, Cancelled or CancelRejected.
+  // An Accepted event carries the order's ID, which is what cancel() takes.
+});
+
+engine.stop();
 ```
+
+Every command is answered by exactly one `Accepted`, `Rejected`, `Cancelled` or
+`CancelRejected` event. An order that trades produces its `Trade` events first
+and its `Accepted` last.
+
+`lob::SpscRing<T>` can also be used on its own, with `try_push`, `try_pop` and
+`drain`, for any trivially copyable `T`.
 
 ## Build
 
@@ -124,6 +147,7 @@ cmake --build build-tsan && ctest --test-dir build-tsan --output-on-failure
 | [tests/model_test.cpp](tests/model_test.cpp) | 66,000 random operations compared step by step against a naive `std::map` reference book. |
 | [tests/allocation_test.cpp](tests/allocation_test.cpp) | Replaces global `operator new` and asserts that nothing allocates after construction. |
 | [tests/spsc_ring_test.cpp](tests/spsc_ring_test.cpp) | FIFO order, full and empty, wrap-around, and two-thread transfers that check nothing is lost, reordered or torn. |
+| [tests/matching_engine_test.cpp](tests/matching_engine_test.cpp) | Every event type, start, stop and restart, shutdown with nobody reading, and 5,000 random commands through 4-slot rings compared event for event against a single-threaded run. |
 
 ## Benchmarks
 
@@ -148,6 +172,8 @@ To run only the headline numbers:
 | `BM_OrderPool_*`, `BM_Heap_NewDelete` | The pool against `new` / `delete`. |
 | `BM_IntrusiveLevel_*`, `BM_StdList_*` | The intrusive queue against `std::list`. |
 | `BM_SpscRing_TwoThreads`, `BM_MutexRing_TwoThreads` | Time per `Trade` delivered from one thread to another, through the ring and through the same ring guarded by a mutex. |
+| `BM_Engine_RoundTrip` | One command sent to the engine thread and its answer received: both rings plus the book. |
+| `BM_Engine_Throughput` | Commands per second through the whole pipeline when the sender does not wait for answers. |
 
 The deep-book benchmarks shuffle their orders first, so resting orders and free
 slots are scattered through memory rather than laid out in insertion order.
@@ -169,6 +195,8 @@ with other programs running: no core isolation, no pinning.
 | `BM_OrderPool_AllocateDeallocate` vs `BM_Heap_NewDelete` | 1.22 ns vs 181 ns |
 | `BM_IntrusiveLevel_AddCancel` vs `BM_StdList_AddCancel` | 2.33 ns vs 197 ns |
 | `BM_SpscRing_TwoThreads` vs `BM_MutexRing_TwoThreads` | 2.5 ns vs 106 ns per event (about 400 million vs 9 million events per second) |
+| `BM_Engine_RoundTrip` | about 250 ns from sending a command to receiving its answer |
+| `BM_Engine_Throughput` | 16 to 19 million commands per second |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
@@ -177,6 +205,9 @@ machine is; run them on the hardware you care about.
 
 - **One symbol per book, one thread per book.** The book has no locks or atomics.
 - **The ring buffer is strictly one producer and one consumer.** A second thread on either side is a data race. It carries trivially copyable types only.
+- **The engine therefore takes commands from one thread and reports events to one thread.** Several gateways would each need their own ring.
+- **A slow event reader stalls the engine.** Events are never dropped while it runs, so a full event ring makes it wait. At shutdown only, events nobody is reading are discarded and counted, so that `stop()` always returns.
+- **The engine thread is not pinned to a core**, and by default it busy-waits, occupying one core even when idle.
 - **The price range is fixed at construction** and holds at most 262,144 levels. Orders outside it are rejected.
 - **Limit orders only.** There are no market, IOC or FOK orders and no self-trade prevention.
 - **A full book rejects every new order**, including one that would have traded, because a slot is reserved before matching.
@@ -193,7 +224,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 5 — Price-time priority matching and `Trade` events
 - [x] Phase 6 — Edge-case tests and latency benchmarks
 - [x] Phase 7 — Lock-free SPSC ring buffer
-- [ ] Next — An engine thread that reads orders from one ring and writes trades to another
+- [x] Phase 8 — Engine thread between a command ring and an event ring
+- [ ] Next — Core pinning, more order types (market, IOC, FOK) and multiple symbols
 
 ## Layout
 

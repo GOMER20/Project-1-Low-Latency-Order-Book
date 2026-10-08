@@ -121,7 +121,8 @@ if(LOB_BUILD_TESTS)
     tests/edge_case_test.cpp
     tests/model_test.cpp
     tests/allocation_test.cpp
-    tests/spsc_ring_test.cpp)
+    tests/spsc_ring_test.cpp
+    tests/matching_engine_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   gtest_discover_tests(lob_tests)
 endif()
@@ -148,6 +149,7 @@ if(LOB_BUILD_BENCHMARKS)
     bench/order_book_bench.cpp
     bench/price_level_bench.cpp
     bench/order_pool_bench.cpp
-    bench/spsc_ring_bench.cpp)
+    bench/spsc_ring_bench.cpp
+    bench/engine_bench.cpp)
   target_link_libraries(lob_bench PRIVATE benchmark::benchmark_main)
 endif()
