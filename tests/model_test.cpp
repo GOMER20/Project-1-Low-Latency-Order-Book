@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <map>
 #include <random>
 #include <utility>
@@ -21,6 +22,7 @@ namespace {
 using lob::kInvalidOrderId;
 using lob::OrderBook;
 using lob::OrderId;
+using lob::OrderType;
 using lob::Price;
 using lob::Quantity;
 using lob::Side;
@@ -46,18 +48,39 @@ class ReferenceBook {
   ReferenceBook(Price min_price, Price num_levels, std::size_t max_orders)
       : min_price_(min_price), num_levels_(num_levels), max_orders_(max_orders) {}
 
-  Outcome submit(Side side, Price price, Quantity quantity) {
-    if (price < min_price_ || price >= min_price_ + num_levels_ || quantity == 0 ||
-        live_.size() == max_orders_) {
+  Outcome submit(Side side, Price price, Quantity quantity, OrderType type) {
+    const bool price_ok = type == OrderType::Market ||
+                          (price >= min_price_ && price < min_price_ + num_levels_);
+    const bool room_ok = type != OrderType::Limit || live_.size() < max_orders_;
+    if (quantity == 0 || !price_ok || !room_ok) {
       return {false, 0, 0, {}};
     }
     const std::size_t key = next_key_++;
     Outcome outcome{true, 0, quantity, {}};
 
     // Both sides are keyed so that begin() is the best price: asks by price,
-    // bids by negated price.
+    // bids by negated price. A market order accepts any price.
     Levels& makers = side == Side::Buy ? asks_ : bids_;
-    const Price threshold = side == Side::Buy ? price : -price;
+    const Price threshold = type == OrderType::Market ? std::numeric_limits<Price>::max()
+                            : side == Side::Buy       ? price
+                                                      : -price;
+
+    if (type == OrderType::FOK) {
+      std::uint64_t available = 0;
+      for (const auto& [level_key, orders] : makers) {
+        if (level_key > threshold) {
+          break;
+        }
+        for (const Resting& order : orders) {
+          available += order.quantity;
+        }
+      }
+      if (available < quantity) {
+        outcome.resting = 0;  // killed: accepted, but nothing trades and nothing rests
+        return outcome;
+      }
+    }
+
     while (outcome.resting != 0 && !makers.empty() && makers.begin()->first <= threshold) {
       std::deque<Resting>& queue = makers.begin()->second;
       Resting& maker = queue.front();
@@ -76,7 +99,9 @@ class ReferenceBook {
       }
     }
 
-    if (outcome.resting != 0) {
+    if (type != OrderType::Limit) {
+      outcome.resting = 0;  // only limit orders rest; the remainder is discarded
+    } else if (outcome.resting != 0) {
       const Price level_key = side == Side::Buy ? -price : price;
       (side == Side::Buy ? bids_ : asks_)[level_key].push_back({key, outcome.resting});
       live_[key] = {side, level_key};
@@ -195,11 +220,17 @@ void run_against_reference(std::uint64_t seed, Price num_levels, std::size_t max
       const Side side = pick(2) == 0 ? Side::Buy : Side::Sell;
       const Price price = kMinPrice - 2 + static_cast<Price>(pick(static_cast<std::uint64_t>(num_levels) + 4));
       const Quantity quantity = pick(50) == 0 ? 0 : static_cast<Quantity>(1 + pick(50));
+      // Five in eight are limit orders; the rest are split between the others.
+      constexpr OrderType kTypes[8] = {OrderType::Limit, OrderType::Limit,  OrderType::Limit,
+                                       OrderType::Limit, OrderType::Limit,  OrderType::Market,
+                                       OrderType::IOC,   OrderType::FOK};
+      const OrderType type = kTypes[pick(8)];
 
-      const Outcome expected = reference.submit(side, price, quantity);
+      const Outcome expected = reference.submit(side, price, quantity, type);
       trades.clear();
-      const lob::SubmitResult actual = book.submit(
-          side, price, quantity, [&](const lob::Trade& trade) { trades.push_back(trade); });
+      const lob::SubmitResult actual =
+          book.submit(side, price, quantity, type,
+                      [&](const lob::Trade& trade) { trades.push_back(trade); });
 
       ASSERT_EQ(actual.id != kInvalidOrderId, expected.accepted) << "acceptance, step " << step;
       ASSERT_EQ(actual.filled, expected.filled) << "filled, step " << step;

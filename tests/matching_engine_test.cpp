@@ -20,6 +20,7 @@ using lob::IdleStrategy;
 using lob::kInvalidOrderId;
 using lob::MatchingEngine;
 using lob::OrderId;
+using lob::OrderType;
 using lob::Price;
 using lob::Quantity;
 using lob::Side;
@@ -146,6 +147,40 @@ TEST_F(EngineByHand, CancelIsAnsweredWithCancelledOnlyWhileTheOrderIsLive) {
   EXPECT_EQ(events[1].client_tag, 3u);
   EXPECT_EQ(events[2].type, EventType::CancelRejected);
   EXPECT_EQ(events[2].order_id, 123'456u);
+  EXPECT_TRUE(engine.book().empty());
+}
+
+// Orders that never rest are still answered with Accepted; `resting` is zero
+// and whatever they did not fill is gone.
+TEST_F(EngineByHand, MarketIocAndFokOrdersTravelThroughTheEngine) {
+  ASSERT_TRUE(engine.submit(1, Side::Sell, 150, 10));
+  (void)run();
+
+  ASSERT_TRUE(engine.submit(2, Side::Buy, 150, 50, OrderType::FOK));     // cannot fill: killed
+  ASSERT_TRUE(engine.submit(3, Side::Buy, 150, 4, OrderType::IOC));      // takes 4
+  ASSERT_TRUE(engine.submit(4, Side::Buy, 0, 100, OrderType::Market));   // takes the last 6
+  const std::vector<Event> events = run();
+
+  ASSERT_EQ(events.size(), 5u);
+  EXPECT_EQ(events[0].type, EventType::Accepted);
+  EXPECT_EQ(events[0].client_tag, 2u);
+  EXPECT_EQ(events[0].quantity, 0u);
+  EXPECT_EQ(events[0].resting, 0u);
+
+  EXPECT_EQ(events[1].type, EventType::Trade);
+  EXPECT_EQ(events[1].quantity, 4u);
+  EXPECT_EQ(events[2].type, EventType::Accepted);
+  EXPECT_EQ(events[2].client_tag, 3u);
+  EXPECT_EQ(events[2].quantity, 4u);
+  EXPECT_EQ(events[2].resting, 0u);
+
+  EXPECT_EQ(events[3].type, EventType::Trade);
+  EXPECT_EQ(events[3].quantity, 6u);
+  EXPECT_EQ(events[4].type, EventType::Accepted);
+  EXPECT_EQ(events[4].client_tag, 4u);
+  EXPECT_EQ(events[4].quantity, 6u);
+  EXPECT_EQ(events[4].resting, 0u);
+
   EXPECT_TRUE(engine.book().empty());
 }
 
@@ -316,8 +351,9 @@ TEST(EngineThread, ThreadedRunMatchesRunningByHandUnderBackPressure) {
         command.side = rng() % 2 == 0 ? Side::Buy : Side::Sell;
         command.price = 99 + static_cast<Price>(rng() % 102);  // 99..200: both ends are invalid
         command.quantity = static_cast<Quantity>(rng() % 31);  // 0 is invalid
+        command.order_type = static_cast<OrderType>(rng() % 4);
         ASSERT_TRUE(by_hand.submit(command.client_tag, command.side, command.price,
-                                   command.quantity));
+                                   command.quantity, command.order_type));
       } else {
         command.type = CommandType::Cancel;
         command.order_id = accepted_ids[static_cast<std::size_t>(rng() % accepted_ids.size())];
@@ -355,7 +391,7 @@ TEST(EngineThread, ThreadedRunMatchesRunningByHandUnderBackPressure) {
     const auto send = [&] {
       return command.type == CommandType::Submit
                  ? engine.submit(command.client_tag, command.side, command.price,
-                                 command.quantity)
+                                 command.quantity, command.order_type)
                  : engine.cancel(command.client_tag, command.order_id);
     };
     while (!send()) {

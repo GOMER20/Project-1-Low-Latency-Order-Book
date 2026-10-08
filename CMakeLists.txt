@@ -122,7 +122,9 @@ if(LOB_BUILD_TESTS)
     tests/model_test.cpp
     tests/allocation_test.cpp
     tests/spsc_ring_test.cpp
-    tests/matching_engine_test.cpp)
+    tests/matching_engine_test.cpp
+    tests/order_type_test.cpp
+    tests/thread_affinity_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   gtest_discover_tests(lob_tests)
 endif()
