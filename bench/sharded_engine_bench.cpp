@@ -105,4 +105,27 @@ void BM_Sharded_Throughput(benchmark::State& state) {
 }
 BENCHMARK(BM_Sharded_Throughput)->Arg(1)->Arg(2)->Arg(4)->UseRealTime();
 
+// How long one move takes when both shards are otherwise idle: the "let go"
+// and "take up" commands crossing the command rings, the old shard's marker
+// crossing its event ring, and the new shard picking the book up. A symbol is
+// passed back and forth between two shards.
+void BM_Sharded_MoveSymbol(benchmark::State& state) {
+  lob::ShardedEngine engine({.books = std::vector<lob::BookConfig>(2, kBook), .shards = 2});
+  engine.start();
+  const auto read_events = [&] { engine.poll([](const Event&) {}); };
+  std::size_t destination = 1;
+
+  for (auto _ : state) {
+    while (engine.move_symbol(0, destination) != SendStatus::Sent) {
+      read_events();
+    }
+    while (engine.move_in_progress(0)) {
+      read_events();  // the move cannot finish until the marker has been read
+    }
+    destination = 1 - destination;
+  }
+  engine.stop();
+}
+BENCHMARK(BM_Sharded_MoveSymbol)->UseRealTime();
+
 }  // namespace

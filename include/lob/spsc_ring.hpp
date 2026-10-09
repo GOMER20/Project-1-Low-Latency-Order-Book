@@ -86,6 +86,25 @@ class SpscRing {
     return tail - head;
   }
 
+  // Consumer thread only. Like drain(), but `visit` returns whether it dealt
+  // with the item. The first item it turns down stays in the ring, along with
+  // everything behind it, to be offered again on the next call. Returns how
+  // many items were consumed. `visit` must not throw.
+  template <std::predicate<const T&> Visitor>
+  std::size_t drain_while(Visitor&& visit) noexcept {
+    const std::size_t head = head_.load(std::memory_order_relaxed);
+    const std::size_t tail = tail_.load(std::memory_order_acquire);
+    std::size_t index = head;
+    while (index != tail && visit(slots_[index & mask_])) {
+      ++index;
+    }
+    tail_cache_ = tail;
+    if (index != head) {
+      head_.store(index, std::memory_order_release);
+    }
+    return index - head;
+  }
+
   [[nodiscard]] std::size_t capacity() const noexcept { return mask_ + 1; }
 
   // Exact when neither thread is mid-call; otherwise a snapshot that may
