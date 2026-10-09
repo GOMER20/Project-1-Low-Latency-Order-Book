@@ -69,7 +69,8 @@ class MatchingEngine {
 
   // All memory for every book and both rings is acquired here.
   explicit MatchingEngine(const EngineConfig& config)
-      : commands_(config.command_capacity),
+      : handled_(config.books.size()),
+        commands_(config.command_capacity),
         events_(config.event_capacity),
         idle_(config.idle),
         pin_to_cpu_(config.pin_to_cpu) {
@@ -196,6 +197,13 @@ class MatchingEngine {
     return events_dropped_.load(std::memory_order_acquire);
   }
 
+  // How many commands the engine has handled for one symbol, whether they
+  // were accepted or refused. A measure of how busy the symbol is.
+  [[nodiscard]] std::uint64_t commands_handled(SymbolId symbol) const noexcept {
+    assert(symbol < handled_.size());
+    return handled_[symbol].load(std::memory_order_relaxed);
+  }
+
   // Only meaningful while the engine thread is not running.
   [[nodiscard]] const OrderBook& book(SymbolId symbol) const noexcept {
     assert(symbol < books_.size());
@@ -226,6 +234,12 @@ class MatchingEngine {
     // does not have gets no book, and the command is answered as refused.
     OrderBook* const book =
         command.symbol < books_.size() ? books_[command.symbol].get() : nullptr;
+
+    if (book != nullptr) [[likely]] {
+      // Only this thread writes the counter, so a plain add is enough.
+      std::atomic<std::uint64_t>& handled = handled_[command.symbol];
+      handled.store(handled.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
 
     Event event{};
     event.client_tag = command.client_tag;
@@ -273,7 +287,8 @@ class MatchingEngine {
     }
   }
 
-  std::vector<std::unique_ptr<OrderBook>> books_;  // indexed by SymbolId
+  std::vector<std::unique_ptr<OrderBook>> books_;    // indexed by SymbolId
+  std::vector<std::atomic<std::uint64_t>> handled_;  // commands handled, per symbol
   SpscRing<Command> commands_;
   SpscRing<Event> events_;
   IdleStrategy idle_;

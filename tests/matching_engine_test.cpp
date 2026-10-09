@@ -203,6 +203,20 @@ TEST_F(EngineByHand, CommandsAreHandledInTheOrderTheyWereSent) {
   EXPECT_EQ(tags, (std::vector<std::uint64_t>{1, 2, 3, 4, 5}));
 }
 
+TEST_F(EngineByHand, CountsTheCommandsHandledForItsSymbol) {
+  EXPECT_EQ(engine.commands_handled(kSymbol), 0u);
+  ASSERT_TRUE(engine.submit(1, kSymbol, Side::Buy, 150, 10));
+  ASSERT_TRUE(engine.submit(2, kSymbol, Side::Buy, 99, 10));  // rejected, but still handled
+  ASSERT_TRUE(engine.cancel(3, kSymbol, 12'345));             // refused, but still handled
+  ASSERT_TRUE(engine.submit(4, 5, Side::Buy, 150, 10));       // no such symbol: not counted
+
+  EXPECT_EQ(engine.commands_handled(kSymbol), 0u);  // nothing has been handled yet
+  (void)run();
+
+  EXPECT_EQ(engine.commands_handled(kSymbol), 3u);
+  EXPECT_EQ(engine.commands_processed(), 4u);
+}
+
 TEST(EngineRings, FullCommandRingRefusesCommandsUntilTheEngineCatchesUp) {
   MatchingEngine engine({.books = {kBook}, .command_capacity = 4});
   for (std::uint64_t tag = 0; tag < 4; ++tag) {

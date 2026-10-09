@@ -31,6 +31,7 @@ through lock-free ring buffers, so no other thread can ever block it.
 | `Command`, `Event` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings. |
 | `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | One `OrderBook` per symbol, all on one engine thread between a command ring and an event ring. The thread can be pinned to a CPU. |
 | `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread, rings and share of the symbols, to use more than one core. |
+| `assign_shards` | [include/lob/shard_assignment.hpp](include/lob/shard_assignment.hpp) | Decides which shard each symbol gets from how busy each is expected to be, so that the shards carry similar totals. |
 
 Design rules followed throughout:
 
@@ -177,6 +178,25 @@ Symbol IDs are the same whatever the number of shards; a small table turns an
 ID into its shard, so routing is still one array lookup. Shards share nothing:
 there is no lock, and no cache line that two engine threads both write.
 
+By default the symbols are dealt to the shards in turn. If a few symbols carry
+most of the traffic, that can leave one shard doing most of the work. Tell the
+engine how busy each symbol is expected to be, and it spreads the busy ones out
+so that every shard carries a similar total:
+
+```cpp
+lob::ShardedEngine engine({.books = books,
+                           .shards = 4,
+                           .loads = orders_per_symbol_yesterday});  // one number per book
+```
+
+The numbers can be in any unit. The engine also measures them for you:
+`engine.measured_loads()` returns how many commands each symbol actually
+received, in the form `loads` expects, so one session's traffic can lay out the
+next. The rule used is "largest first": take the symbols from busiest to
+quietest and give each to the shard carrying the least so far. The busiest
+shard then never carries more than 4/3 of what the best possible split would
+give it.
+
 Two things differ from a single engine:
 
 - **Threads.** Each shard's rings still take one thread on each end. One thread
@@ -244,6 +264,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/matching_engine_test.cpp](tests/matching_engine_test.cpp) | Every event type, start, stop and restart, shutdown with nobody reading, and 6,000 random commands for three books through 4-slot rings compared event for event against a single-threaded run. |
 | [tests/multi_symbol_test.cpp](tests/multi_symbol_test.cpp) | Routing by symbol, unknown symbols, per-book order IDs and limits, and 9,000 interleaved commands checked against running each symbol alone. |
 | [tests/sharded_engine_test.cpp](tests/sharded_engine_test.cpp) | How symbols are dealt to shards, routing and symbol IDs, one feeder thread per shard, and 12,000 random commands through three shard threads compared, symbol by symbol, with each symbol running alone. |
+| [tests/shard_assignment_test.cpp](tests/shard_assignment_test.cpp) | Equal loads dealt in turn, busy symbols kept apart, no shard left empty, and 400 random cases checked against the best possible split. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
 
@@ -307,7 +328,8 @@ machine is; run them on the hardware you care about.
 
 - **One symbol per book, one thread per book.** The book has no locks or atomics.
 - **One engine thread runs all of its symbols.** `ShardedEngine` uses more cores by running several engines, each with its own symbols and rings. An engine holds at most 65,535 symbols.
-- **Symbols are dealt to shards in turn, not by load.** A few very busy symbols can land on the same shard. A symbol never moves between shards.
+- **Symbols are assigned to shards once, at start-up.** They are dealt in turn unless you supply expected loads. A symbol never moves between shards while the engine is running, so a symbol that becomes busy mid-session stays where it is.
+- **Load-based assignment is good, not optimal.** The busiest shard carries at most 4/3 of the best possible, and a single symbol busier than all the others together still fills a shard on its own.
 - **There is no ordering between shards.** Events for one symbol are in order; events for symbols on different shards are not ordered relative to each other.
 - **Order IDs are unique within a symbol, not across symbols.** A cancel must name both.
 - **The ring buffer is strictly one producer and one consumer.** A second thread on either side is a data race. It carries trivially copyable types only.
@@ -336,7 +358,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 10 — Continuous integration on Linux and macOS
 - [x] Phase 11 — Multiple symbols on one engine
 - [x] Phase 12 — Several engine threads, each with its own share of the symbols
-- [ ] Next — Assigning symbols to shards by load
+- [x] Phase 13 — Assigning symbols to shards by expected or measured load
+- [ ] Next — Moving a symbol between shards while the engine is running
 
 ## Layout
 
