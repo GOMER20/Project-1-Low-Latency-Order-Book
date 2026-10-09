@@ -14,6 +14,8 @@ enum class CommandType : std::uint8_t {
   // another; see MatchingEngine::detach(). `quantity` carries the move's number.
   Detach,  // stop running this symbol and say so
   Attach,  // start running this symbol, once it has been let go
+  // Asks for a fresh picture of one symbol on the market data feed.
+  Snapshot,
 };
 
 // A request sent to the engine thread.
@@ -75,5 +77,39 @@ struct Event {
 
 static_assert(sizeof(Event) == 48);
 static_assert(std::is_trivial_v<Event> && std::is_standard_layout_v<Event>);
+
+// The public market data feed: what anyone may see of a symbol, as opposed to
+// the Events above, which tell the sender of an order what became of it.
+enum class MarketDataType : std::uint8_t {
+  BestPrices,  // the best bid and ask and the quantity at each, after either changed
+  Level,       // the total quantity now resting at one price on one side; 0 means none
+  Trade,       // a trade: its price, its size and the side of the incoming order
+  Clear,       // forget what you know of this symbol's depth: a fresh picture follows
+};
+
+// One message on the feed. Exactly one cache line.
+//
+// Quantities are absolute, never changes: a Level message gives the total at a
+// price, not how much was added or removed. A reader that misses a message is
+// therefore wrong only about that price, and only until it next changes.
+//
+// `sequence` counts a symbol's messages from 1 with no gaps, so a jump means
+// some were dropped because the reader fell behind. Fields that do not belong
+// to a message's type are zero.
+struct MarketData {
+  std::uint64_t sequence;
+  Price price;                 // Level, Trade
+  std::uint64_t quantity;      // Level: total resting at `price`. Trade: size of the trade
+  Price bid_price;             // BestPrices; meaningful only if bid_quantity is not 0
+  std::uint64_t bid_quantity;  // BestPrices: resting at the best bid; 0 if there are no bids
+  Price ask_price;             // BestPrices; meaningful only if ask_quantity is not 0
+  std::uint64_t ask_quantity;  // BestPrices: resting at the best ask; 0 if there are no asks
+  SymbolId symbol;
+  Side side;                   // Level: which side. Trade: the incoming order's side
+  MarketDataType type;
+};
+
+static_assert(sizeof(MarketData) == 64);
+static_assert(std::is_trivial_v<MarketData> && std::is_standard_layout_v<MarketData>);
 
 }  // namespace lob

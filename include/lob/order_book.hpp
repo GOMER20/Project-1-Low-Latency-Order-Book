@@ -184,6 +184,21 @@ class OrderBook {
     return level < num_levels_ ? sides_[side_index(side)].levels[level].total_quantity : 0;
   }
 
+  // Visits every price with resting orders on one side, best price first,
+  // passing the price and the total quantity resting there. It hops from one
+  // occupied level to the next with the bitmap, so empty prices cost nothing.
+  // For snapshots; not part of the hot path.
+  template <std::invocable<Price, std::uint64_t> Visitor>
+  void for_each_level(Side side, Visitor&& visit) const {
+    const BookSide& book_side = sides_[side_index(side)];
+    std::size_t level = best_level(side);
+    while (level != LevelBitmap::npos) {
+      visit(min_price_ + static_cast<Price>(level), book_side.levels[level].total_quantity);
+      level = side == Side::Buy ? book_side.occupied.find_prev(level)
+                                : book_side.occupied.find_next(level);
+    }
+  }
+
   // The live order with this ID, or nullptr.
   [[nodiscard]] const Order* find(OrderId id) const noexcept {
     const OrderIndex index = slot_of(id);

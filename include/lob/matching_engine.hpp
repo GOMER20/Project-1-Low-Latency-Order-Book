@@ -40,6 +40,11 @@ struct EngineConfig {
   // Time one command in this many, on average, to estimate how long each
   // symbol's commands take; see time_spent(). 0 turns timing off.
   std::uint32_t time_one_in = 64;
+
+  // Capacity of the market data ring; rounded up to a power of two. 0 turns
+  // the market data feed off, which is the default: it costs something on
+  // every order, and not every use of the engine wants it.
+  std::size_t market_data_capacity = 0;
 };
 
 // Decides how much of one timed command to count, and keeps `typical_x256` up
@@ -76,13 +81,28 @@ struct MigrationGate {
   std::atomic<std::uint32_t> attached{0};   // the new engine has taken the book up
 };
 
+// What the market data feed remembers about one symbol between messages. It
+// goes wherever the symbol's book goes, so that the numbering carries on
+// across a move from one engine to another.
+struct FeedState {
+  std::uint64_t sequence = 0;  // the last sequence number used for this symbol
+  // The best prices as last published, to tell whether they have changed.
+  Price bid_price = 0;
+  std::uint64_t bid_quantity = 0;
+  Price ask_price = 0;
+  std::uint64_t ask_quantity = 0;
+};
+
 // Shared by a group of engines that can pass symbols between them: every
-// symbol's book, and its gate. The engines do not own the books.
+// symbol's book, its gate and its feed state. The engines do not own the
+// books.
 struct SymbolDirectory {
-  explicit SymbolDirectory(std::size_t symbols) : books(symbols, nullptr), gates(symbols) {}
+  explicit SymbolDirectory(std::size_t symbols)
+      : books(symbols, nullptr), gates(symbols), feeds(symbols) {}
 
   std::vector<OrderBook*> books;     // by SymbolId
   std::vector<MigrationGate> gates;  // by SymbolId
+  std::vector<FeedState> feeds;      // by SymbolId; used only by the engine running the symbol
 };
 
 // One order book per symbol, all running on a single engine thread that is fed
@@ -122,11 +142,15 @@ class MatchingEngine {
       : books_(config.books.size(), nullptr),
         handled_(config.books.size()),
         timed_(config.books.size()),
+        own_feeds_(config.books.size()),
+        feeds_(own_feeds_.data()),
         commands_(config.command_capacity),
         events_(config.event_capacity),
+        market_data_(std::max<std::size_t>(config.market_data_capacity, 1)),
         idle_(config.idle),
         pin_to_cpu_(config.pin_to_cpu),
         time_one_in_(config.time_one_in),
+        feed_on_(config.market_data_capacity != 0),
         sample_countdown_(config.time_one_in != 0 ? 1 : 0) {
     assert(!config.books.empty() && config.books.size() <= kMaxSymbols);
     owned_.reserve(config.books.size());
@@ -146,11 +170,14 @@ class MatchingEngine {
         handled_(directory.books.size()),
         timed_(directory.books.size()),
         directory_(&directory),
+        feeds_(directory.feeds.data()),
         commands_(config.command_capacity),
         events_(config.event_capacity),
+        market_data_(std::max<std::size_t>(config.market_data_capacity, 1)),
         idle_(config.idle),
         pin_to_cpu_(config.pin_to_cpu),
         time_one_in_(config.time_one_in),
+        feed_on_(config.market_data_capacity != 0),
         sample_countdown_(config.time_one_in != 0 ? 1 : 0) {
     for (const SymbolId symbol : running) {
       books_[symbol] = directory.books[symbol];
@@ -267,6 +294,14 @@ class MatchingEngine {
     return commands_.try_push(migration_command(CommandType::Attach, symbol, move_number));
   }
 
+  // Asks for a fresh picture of one symbol on the market data feed: a Clear,
+  // then a Level for every price with resting orders, then the BestPrices.
+  // For a reader that has just started, or has seen a gap in the sequence
+  // numbers. Does nothing if the feed is off.
+  [[nodiscard]] bool request_snapshot(SymbolId symbol) noexcept {
+    return commands_.try_push(migration_command(CommandType::Snapshot, symbol, 0));
+  }
+
   // Whether the command ring is full right now. Only the gateway thread adds
   // to the ring, so if it sees room, its next push will succeed.
   [[nodiscard]] bool command_ring_full() const noexcept {
@@ -279,6 +314,20 @@ class MatchingEngine {
   template <std::invocable<const Event&> Visitor>
   std::size_t poll(Visitor&& visit) noexcept {
     return events_.drain(std::forward<Visitor>(visit));
+  }
+
+  // --- Market data thread ----------------------------------------------------
+
+  // Passes every market data message published so far to `visit`, in order.
+  // Returns how many. One thread only, which need not be the publisher thread.
+  //
+  // Unlike events, market data is never waited for. If this reader falls
+  // behind and the ring fills, the engine carries on and the messages that do
+  // not fit are dropped; see market_data_dropped(). The reader sees a jump in
+  // a symbol's sequence numbers and can ask for a snapshot.
+  template <std::invocable<const MarketData&> Visitor>
+  std::size_t poll_market_data(Visitor&& visit) noexcept {
+    return market_data_.drain(std::forward<Visitor>(visit));
   }
 
   // --- Engine thread ---------------------------------------------------------
@@ -307,7 +356,7 @@ class MatchingEngine {
         ++orders;
         return true;
       }
-      return handle_migration(command);
+      return handle_other(command);
     });
     sample_countdown_ = countdown;
     if (orders != 0) {
@@ -326,6 +375,11 @@ class MatchingEngine {
 
   [[nodiscard]] std::uint64_t events_dropped() const noexcept {
     return events_dropped_.load(std::memory_order_acquire);
+  }
+
+  // Market data messages dropped because the ring was full.
+  [[nodiscard]] std::uint64_t market_data_dropped() const noexcept {
+    return market_data_dropped_.load(std::memory_order_acquire);
   }
 
   // How many commands the engine has handled for one symbol, whether they
@@ -399,13 +453,25 @@ class MatchingEngine {
     draining_ = false;
   }
 
-  // Returns false if the command cannot be handled yet and must stay queued.
-  bool handle_migration(const Command& command) noexcept {
-    if (command.type == CommandType::Detach) {
-      handle_detach(command);
-      return true;
+  // The commands that are not orders. Returns false if the command cannot be
+  // handled yet and must stay queued.
+  bool handle_other(const Command& command) noexcept {
+    switch (command.type) {
+      case CommandType::Detach:
+        handle_detach(command);
+        return true;
+      case CommandType::Attach:
+        return handle_attach(command);
+      case CommandType::Snapshot:
+        if (feed_on_ && command.symbol < books_.size() && books_[command.symbol] != nullptr) {
+          feed_snapshot(command.symbol, *books_[command.symbol]);
+        }
+        return true;
+      case CommandType::Submit:
+      case CommandType::Cancel:
+        break;
     }
-    return command.type != CommandType::Attach || handle_attach(command);
+    return true;
   }
 
   // Handles one command with a stopwatch on it, and returns how many commands
@@ -462,7 +528,13 @@ class MatchingEngine {
                                 fill.side = trade.taker_side;
                                 fill.type = EventType::Trade;
                                 publish(fill);
+                                if (feed_on_) {
+                                  feed_trade(command.symbol, *book, trade);
+                                }
                               });
+        if (feed_on_) {
+          feed_after_submit(command, *book, result);
+        }
       }
       event.order_id = result.id;
       event.price = command.price;
@@ -471,11 +543,135 @@ class MatchingEngine {
       event.side = command.side;
       event.type = result.id != kInvalidOrderId ? EventType::Accepted : EventType::Rejected;
     } else {
+      // The feed needs to know which price the order was at, and once it has
+      // been cancelled the book no longer says.
+      Side side = Side::Buy;
+      Price price = 0;
+      if (feed_on_ && book != nullptr) {
+        if (const Order* order = book->find(command.order_id)) {
+          side = order->side;
+          price = order->price;
+        }
+      }
       const bool cancelled = book != nullptr && book->cancel(command.order_id);
+      if (cancelled && feed_on_) {
+        feed_level(command.symbol, *book, side, price);
+        feed_best_prices(command.symbol, *book, /*even_if_unchanged=*/false);
+      }
       event.order_id = command.order_id;
       event.type = cancelled ? EventType::Cancelled : EventType::CancelRejected;
     }
     publish(event);
+  }
+
+  // --- The market data feed ---------------------------------------------------
+  // All of this runs only when the feed is on.
+
+  // Numbers a message and offers it to the ring. If the ring is full the
+  // message is dropped, but its number is still used up, which is how a reader
+  // can tell.
+  void feed_send(MarketData& message) noexcept {
+    message.sequence = ++feeds_[message.symbol].sequence;
+    if (!market_data_.try_push(message)) {
+      market_data_dropped_.store(market_data_dropped_.load(std::memory_order_relaxed) + 1,
+                                 std::memory_order_release);
+    }
+  }
+
+  // The total now resting at one price.
+  void feed_level(SymbolId symbol, const OrderBook& book, Side side, Price price) noexcept {
+    MarketData message{};
+    message.type = MarketDataType::Level;
+    message.symbol = symbol;
+    message.side = side;
+    message.price = price;
+    message.quantity = book.quantity_at(side, price);
+    feed_send(message);
+  }
+
+  // The best bid and ask, if they differ from what was last published.
+  void feed_best_prices(SymbolId symbol, const OrderBook& book,
+                        bool even_if_unchanged) noexcept {
+    const std::optional<Price> bid = book.best_bid();
+    const std::optional<Price> ask = book.best_ask();
+    const Price bid_price = bid.value_or(0);
+    const Price ask_price = ask.value_or(0);
+    const std::uint64_t bid_quantity = bid ? book.quantity_at(Side::Buy, *bid) : 0;
+    const std::uint64_t ask_quantity = ask ? book.quantity_at(Side::Sell, *ask) : 0;
+
+    FeedState& last = feeds_[symbol];
+    if (!even_if_unchanged && bid_price == last.bid_price && bid_quantity == last.bid_quantity &&
+        ask_price == last.ask_price && ask_quantity == last.ask_quantity) {
+      return;
+    }
+    last.bid_price = bid_price;
+    last.bid_quantity = bid_quantity;
+    last.ask_price = ask_price;
+    last.ask_quantity = ask_quantity;
+
+    MarketData message{};
+    message.type = MarketDataType::BestPrices;
+    message.symbol = symbol;
+    message.bid_price = bid_price;
+    message.bid_quantity = bid_quantity;
+    message.ask_price = ask_price;
+    message.ask_quantity = ask_quantity;
+    feed_send(message);
+  }
+
+  // Called for each fill. An incoming order may take many orders at one price;
+  // the feed reports every trade, but each price's new total only once, when
+  // the order has finished with that price.
+  void feed_trade(SymbolId symbol, const OrderBook& book, const Trade& trade) noexcept {
+    if (traded_price_pending_ && traded_price_ != trade.price) {
+      feed_level(symbol, book, opposite(trade.taker_side), traded_price_);
+    }
+    traded_price_pending_ = true;
+    traded_price_ = trade.price;
+
+    MarketData message{};
+    message.type = MarketDataType::Trade;
+    message.symbol = symbol;
+    message.side = trade.taker_side;
+    message.price = trade.price;
+    message.quantity = trade.quantity;
+    feed_send(message);
+  }
+
+  // Called once an incoming order has been dealt with: the last price it
+  // traded at, the price it now rests at if it does, and the best prices.
+  void feed_after_submit(const Command& command, const OrderBook& book,
+                         const SubmitResult& result) noexcept {
+    if (traded_price_pending_) {
+      feed_level(command.symbol, book, opposite(command.side), traded_price_);
+      traded_price_pending_ = false;
+    }
+    if (result.resting != 0) {
+      feed_level(command.symbol, book, command.side, command.price);
+    }
+    if (result.filled != 0 || result.resting != 0) {
+      feed_best_prices(command.symbol, book, /*even_if_unchanged=*/false);
+    }
+  }
+
+  // A fresh picture of one symbol: Clear, every occupied price, best prices.
+  void feed_snapshot(SymbolId symbol, const OrderBook& book) noexcept {
+    MarketData clear{};
+    clear.type = MarketDataType::Clear;
+    clear.symbol = symbol;
+    feed_send(clear);
+    for (const Side side : {Side::Buy, Side::Sell}) {
+      book.for_each_level(side, [&](Price price, std::uint64_t quantity) {
+        MarketData message{};
+        message.type = MarketDataType::Level;
+        message.symbol = symbol;
+        message.side = side;
+        message.price = price;
+        message.quantity = quantity;
+        feed_send(message);
+      });
+    }
+    feed_best_prices(symbol, book, /*even_if_unchanged=*/true);
   }
 
   // Stop running a symbol. Everything queued for it ahead of this command has
@@ -521,6 +717,12 @@ class MatchingEngine {
     books_[command.symbol] = directory_->books[command.symbol];
     gate.attached.store(move_number, std::memory_order_release);
     waiting_to_attach_ = false;
+    if (feed_on_) {
+      // The symbol's market data now comes from this engine's ring, and a
+      // reader may meet these messages before the last of the old engine's.
+      // Starting with a fresh picture means it does not matter if it does.
+      feed_snapshot(command.symbol, *books_[command.symbol]);
+    }
     return true;
   }
 
@@ -547,11 +749,21 @@ class MatchingEngine {
   std::vector<std::atomic<std::uint64_t>> handled_;  // commands handled, per symbol
   std::vector<std::atomic<std::uint64_t>> timed_;    // ticks spent on the timed ones, per symbol
   SymbolDirectory* directory_ = nullptr;             // set only for a member of a group
+  std::vector<FeedState> own_feeds_;                 // feed state for an engine with its own books
+  FeedState* feeds_;                                 // feed state by SymbolId: own, or the group's
   SpscRing<Command> commands_;
   SpscRing<Event> events_;
+  SpscRing<MarketData> market_data_;
   IdleStrategy idle_;
   int pin_to_cpu_;
   std::uint32_t time_one_in_;
+  bool feed_on_;
+
+  // Used only while the feed is on, by whichever thread is running the engine:
+  // the price the order being handled last traded at, whose new total has yet
+  // to be published.
+  bool traded_price_pending_ = false;
+  Price traded_price_ = 0;
 
   // Touched only by whichever thread is running the engine. The countdown is
   // read and written once per batch; the rest only when a command is timed.
@@ -575,6 +787,7 @@ class MatchingEngine {
   std::atomic<bool> pinned_{false};
   std::atomic<std::uint64_t> commands_processed_{0};
   std::atomic<std::uint64_t> events_dropped_{0};
+  std::atomic<std::uint64_t> market_data_dropped_{0};
 
   std::thread thread_;
 };
