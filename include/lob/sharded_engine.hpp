@@ -17,10 +17,27 @@
 
 namespace lob {
 
+// When and how readily ShardedEngine::rebalance() moves a symbol.
+struct RebalanceConfig {
+  // Look at the load after every this-many commands have been sent, from
+  // inside submit() and cancel(). 0 leaves it to the caller to call
+  // rebalance(). Turn this on only if one thread feeds every shard.
+  std::uint64_t every = 0;
+
+  // Leave things alone while the busiest shard carries no more than its fair
+  // share plus this much. Each move briefly pauses a shard, so small or
+  // passing differences are not worth one.
+  std::uint32_t tolerance_percent = 25;
+
+  // Do not judge on fewer handled commands than this.
+  std::uint64_t min_sample = 1'000;
+};
+
 struct ShardedConfig {
   std::vector<BookConfig> books;           // one per symbol; a symbol's ID is its position here
   std::size_t shards = 1;                  // engine threads; never more than there are symbols
   std::vector<std::uint64_t> loads = {};   // optional: how busy each symbol is expected to be
+  RebalanceConfig rebalance = {};          // optional: evening out the shards as traffic shifts
   std::size_t command_capacity = 1 << 16;  // per shard
   std::size_t event_capacity = 1 << 16;    // per shard
   IdleStrategy idle = IdleStrategy::Spin;
@@ -55,7 +72,10 @@ enum class SendStatus : std::uint8_t {
 // similar total; see assign_shards(). measured_loads() reports what each
 // symbol actually received, ready to be used as the loads for the next run.
 //
-// move_symbol() moves a symbol to another shard while the engine runs.
+// move_symbol() moves a symbol to another shard while the engine runs, and
+// rebalance() uses it to even the shards out as traffic shifts: it measures
+// what each symbol has been receiving and, if one shard is carrying clearly
+// more than its share, moves one symbol off it.
 //
 // Callers use one set of symbol IDs for the whole group, wherever a symbol is
 // running; a table of one entry per symbol says which shard that is.
@@ -66,6 +86,7 @@ enum class SendStatus : std::uint8_t {
 //                        shard, or each shard may have a feeder of its own.
 //   poll()               one thread per shard, on the same terms.
 //   move_symbol()        the thread that feeds both shards involved
+//   rebalance()          the thread that feeds every shard
 //   start(), stop()      one controlling thread
 //
 // Order. Events for one symbol arrive in the order they happened, including
@@ -76,7 +97,8 @@ class ShardedEngine {
   explicit ShardedEngine(const ShardedConfig& config)
       : directory_(config.books.size()),
         shard_of_(config.books.size()),
-        moves_(config.books.size()) {
+        moves_(config.books.size()),
+        rebalance_(config.rebalance) {
     assert(!config.books.empty() && config.books.size() <= MatchingEngine::kMaxSymbols);
     const std::size_t shard_count =
         std::clamp<std::size_t>(config.shards, 1, config.books.size());
@@ -99,6 +121,14 @@ class ShardedEngine {
       shard_of_[symbol].store(shard_for[symbol], std::memory_order_relaxed);
       running[shard_for[symbol]].push_back(static_cast<SymbolId>(symbol));
     }
+
+    // Working space for rebalance(), so that it never allocates.
+    balance_.seen.assign(config.books.size(), 0);
+    balance_.handled.assign(config.books.size(), 0);
+    balance_.load.assign(config.books.size(), 0);
+    balance_.proposed.assign(config.books.size(), 0);
+    balance_.where.assign(config.books.size(), 0);
+    balance_.carried.assign(shard_count, 0);
 
     shards_.reserve(shard_count);
     for (std::size_t shard = 0; shard < shard_count; ++shard) {
@@ -192,9 +222,11 @@ class ShardedEngine {
       return SendStatus::UnknownSymbol;
     }
     MatchingEngine& shard = *shards_[shard_of_[symbol].load(std::memory_order_relaxed)];
-    return shard.submit(client_tag, symbol, side, price, quantity, order_type)
-               ? SendStatus::Sent
-               : SendStatus::RingFull;
+    if (!shard.submit(client_tag, symbol, side, price, quantity, order_type)) {
+      return SendStatus::RingFull;
+    }
+    count_towards_rebalance();
+    return SendStatus::Sent;
   }
 
   [[nodiscard]] SendStatus cancel(std::uint64_t client_tag, SymbolId symbol,
@@ -203,7 +235,11 @@ class ShardedEngine {
       return SendStatus::UnknownSymbol;
     }
     MatchingEngine& shard = *shards_[shard_of_[symbol].load(std::memory_order_relaxed)];
-    return shard.cancel(client_tag, symbol, order_id) ? SendStatus::Sent : SendStatus::RingFull;
+    if (!shard.cancel(client_tag, symbol, order_id)) {
+      return SendStatus::RingFull;
+    }
+    count_towards_rebalance();
+    return SendStatus::Sent;
   }
 
   // Moves a symbol to another shard while the engine is running. The book, its
@@ -266,6 +302,76 @@ class ShardedEngine {
     assert(symbol < moves_.size());
     return directory_.gates[symbol].attached.load(std::memory_order_acquire) !=
            moves_[symbol].load(std::memory_order_acquire);
+  }
+
+  // Evens the shards out according to the traffic each symbol has actually
+  // been receiving. One call takes one look and starts at most one move;
+  // returns the symbol it moved, if any.
+  //
+  // A symbol's "load" is a running total of the commands handled for it, in
+  // which older traffic counts for less: at each look that reaches a decision,
+  // the total so far is cut by a quarter and what has arrived since is added.
+  // So a burst in one symbol does not by itself cause a move, while a lasting
+  // shift shows up within a few looks.
+  //
+  // If the busiest shard is carrying more than its fair share plus the
+  // configured tolerance, one symbol is moved from it to the quietest shard:
+  // the one that narrows the gap between the two the most, provided it at
+  // least halves it. See choose_rebalancing_move().
+  //
+  // It does nothing while an earlier move of its own is still under way, or
+  // until min_sample commands have been handled since the last look, so it is
+  // cheap and safe to call often. It never allocates.
+  //
+  // Who may call it: only the thread that feeds every shard, because it may
+  // call move_symbol(). With RebalanceConfig::every set, submit() and
+  // cancel() call it for you.
+  std::optional<SymbolId> rebalance() noexcept {
+    if (shards_.size() < 2) {
+      return std::nullopt;
+    }
+    // One move at a time: each pauses its destination, and the load is not
+    // worth measuring while a symbol is in flight.
+    if (balance_.moving) {
+      if (move_in_progress(balance_.moved)) {
+        return std::nullopt;
+      }
+      balance_.moving = false;
+    }
+
+    std::uint64_t sample = 0;
+    for (std::size_t symbol = 0; symbol < books_.size(); ++symbol) {
+      balance_.handled[symbol] = commands_handled(static_cast<SymbolId>(symbol));
+      const std::uint64_t recent = balance_.handled[symbol] - balance_.seen[symbol];
+      // Older traffic fades: keep three quarters of the total, add what is new.
+      balance_.proposed[symbol] = balance_.load[symbol] - balance_.load[symbol] / 4 + recent;
+      balance_.where[symbol] = shard_of_[symbol].load(std::memory_order_relaxed);
+      sample += recent;
+    }
+    if (sample < rebalance_.min_sample) {
+      return std::nullopt;  // too little to judge on: keep counting
+    }
+
+    const std::optional<RebalancingMove> move = choose_rebalancing_move(
+        balance_.proposed, balance_.where, balance_.carried, rebalance_.tolerance_percent);
+    if (move) {
+      const auto symbol = static_cast<SymbolId>(move->symbol);
+      if (move_symbol(symbol, move->to) != SendStatus::Sent) {
+        return std::nullopt;  // a ring is full: this look does not count
+      }
+      balance_.moving = true;
+      balance_.moved = symbol;
+      ++balance_.moves_started;
+    }
+    // The look counts: adopt the new totals, and measure afresh from here.
+    balance_.load.swap(balance_.proposed);
+    balance_.seen.swap(balance_.handled);
+    return move ? std::optional<SymbolId>(static_cast<SymbolId>(move->symbol)) : std::nullopt;
+  }
+
+  // How many moves rebalance() has started. Gateway thread only.
+  [[nodiscard]] std::uint64_t rebalancing_moves() const noexcept {
+    return balance_.moves_started;
   }
 
   // --- Publisher threads -----------------------------------------------------
@@ -363,11 +469,37 @@ class ShardedEngine {
   }
 
  private:
+  // The automatic trigger. With it off, this is one test of a value that
+  // never changes.
+  void count_towards_rebalance() noexcept {
+    if (rebalance_.every != 0 && ++balance_.sent_since_look >= rebalance_.every) {
+      balance_.sent_since_look = 0;
+      static_cast<void>(rebalance());
+    }
+  }
+
+  // Everything rebalance() needs between calls. Used only by the thread that
+  // feeds the shards.
+  struct Balance {
+    std::vector<std::uint64_t> seen;      // commands handled per symbol at the last decision
+    std::vector<std::uint64_t> handled;   // the same, as of this look
+    std::vector<std::uint64_t> load;      // each symbol's running total, older traffic fading
+    std::vector<std::uint64_t> proposed;  // what those totals become if this look counts
+    std::vector<std::uint16_t> where;     // each symbol's shard, as of this look
+    std::vector<std::uint64_t> carried;   // each shard's load
+    std::uint64_t sent_since_look = 0;
+    std::uint64_t moves_started = 0;
+    SymbolId moved = 0;                  // the symbol rebalance() last moved
+    bool moving = false;                 // whether that move may still be under way
+  };
+
   std::vector<std::unique_ptr<OrderBook>> books_;         // every book, by SymbolId
   SymbolDirectory directory_;                             // what the shards share
   std::vector<std::uint64_t> loads_;                      // expected load, by SymbolId
   std::vector<std::atomic<std::uint16_t>> shard_of_;      // where each symbol's commands go
   std::vector<std::atomic<std::uint32_t>> moves_;         // how many times each has been moved
+  RebalanceConfig rebalance_;
+  Balance balance_;
   std::vector<std::unique_ptr<MatchingEngine>> shards_;   // last: destroyed first
 };
 

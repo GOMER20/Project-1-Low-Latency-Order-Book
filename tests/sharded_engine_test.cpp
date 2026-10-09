@@ -359,7 +359,15 @@ TEST(ShardedThreads, EachShardCanBeFedByItsOwnThread) {
 // 4-slot rings, so that every shard is constantly blocked on a full ring.
 // For each symbol, the events that come back must match exactly, however the
 // symbols were assigned to shards.
-void expect_every_symbol_to_behave_as_if_alone(const std::vector<std::uint64_t>& loads) {
+// Returns how many moves the engine's own rebalancing started.
+//
+// With `lopsided` set, most of the traffic is for symbols 0 and 3, which start
+// out on the same shard.
+std::uint64_t expect_every_symbol_to_behave_as_if_alone(
+    const std::vector<std::uint64_t>& loads, const lob::RebalanceConfig& rebalance = {},
+    bool lopsided = false) {
+  std::uint64_t rebalancing_moves = 0;
+  [&] {
   const std::vector<lob::BookConfig> books{
       {.symbol = "AAA", .min_price = 100, .num_levels = 60, .max_orders = 128},
       {.symbol = "BBB", .min_price = 100, .num_levels = 60, .max_orders = 16},
@@ -383,7 +391,9 @@ void expect_every_symbol_to_behave_as_if_alone(const std::vector<std::uint64_t>&
     std::mt19937_64 rng(2026);
 
     for (int i = 0; i < kCommands; ++i) {
-      const auto symbol = static_cast<SymbolId>(rng() % books.size());
+      const auto symbol = lopsided && rng() % 100 < 70
+                              ? static_cast<SymbolId>(rng() % 2 == 0 ? 0 : 3)
+                              : static_cast<SymbolId>(rng() % books.size());
       Command command{};
       command.client_tag = static_cast<std::uint64_t>(i);
       command.symbol = symbol;
@@ -417,6 +427,7 @@ void expect_every_symbol_to_behave_as_if_alone(const std::vector<std::uint64_t>&
   ShardedEngine engine({.books = books,
                         .shards = 3,
                         .loads = loads,
+                        .rebalance = rebalance,
                         .command_capacity = 4,
                         .event_capacity = 4,
                         .idle = IdleStrategy::Yield});
@@ -455,7 +466,7 @@ void expect_every_symbol_to_behave_as_if_alone(const std::vector<std::uint64_t>&
 
   // 3. Symbol by symbol, the two must agree.
   for (std::size_t symbol = 0; symbol < books.size(); ++symbol) {
-    ASSERT_GT(expected[symbol].size(), 1'000u) << "symbol " << symbol << " was barely exercised";
+    ASSERT_GT(expected[symbol].size(), 300u) << "symbol " << symbol << " was barely exercised";
     ASSERT_EQ(actual[symbol].size(), expected[symbol].size()) << "symbol " << symbol;
     for (std::size_t i = 0; i < expected[symbol].size(); ++i) {
       const Event& got = actual[symbol][i];
@@ -470,16 +481,28 @@ void expect_every_symbol_to_behave_as_if_alone(const std::vector<std::uint64_t>&
   }
   EXPECT_EQ(engine.events_dropped(), 0u);
   EXPECT_EQ(engine.commands_processed(), script.size());
+  rebalancing_moves = engine.rebalancing_moves();
+  }();
+  return rebalancing_moves;
 }
 
 TEST(ShardedThreads, EverySymbolBehavesAsIfItHadAnEngineToItself) {
-  expect_every_symbol_to_behave_as_if_alone({});
+  (void)expect_every_symbol_to_behave_as_if_alone({});
+}
+
+// The same check with the engine moving symbols about by itself as it goes.
+// Most of the traffic is for two symbols that start on the same shard, so it
+// has something to put right.
+TEST(ShardedThreads, EverySymbolBehavesAsIfAloneWhileTheEngineRebalancesItself) {
+  const std::uint64_t moves = expect_every_symbol_to_behave_as_if_alone(
+      {}, {.every = 200, .tolerance_percent = 10, .min_sample = 100}, /*lopsided=*/true);
+  EXPECT_GT(moves, 0u) << "the engine never rebalanced, so this proved nothing";
 }
 
 // The same check with the symbols assigned by load, which puts them on
 // different shards from the run above.
 TEST(ShardedThreads, EverySymbolBehavesAsIfAloneWhenAssignedByLoad) {
-  expect_every_symbol_to_behave_as_if_alone({900, 10, 10, 800, 10, 700, 10});
+  (void)expect_every_symbol_to_behave_as_if_alone({900, 10, 10, 800, 10, 700, 10});
 }
 
 // --- Assigning symbols to shards by load -------------------------------------------

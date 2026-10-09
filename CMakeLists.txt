@@ -127,7 +127,8 @@ if(LOB_BUILD_TESTS)
     tests/multi_symbol_test.cpp
     tests/sharded_engine_test.cpp
     tests/shard_assignment_test.cpp
-    tests/symbol_move_test.cpp)
+    tests/symbol_move_test.cpp
+    tests/rebalance_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   # Listing the tests runs the binary at build time. The default limit of 5
   # seconds is too tight for a sanitizer build on a busy machine.
