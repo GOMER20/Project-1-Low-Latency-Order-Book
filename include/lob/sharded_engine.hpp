@@ -21,7 +21,7 @@ struct ShardedConfig {
   std::size_t command_capacity = 1 << 16;  // per shard
   std::size_t event_capacity = 1 << 16;    // per shard
   IdleStrategy idle = IdleStrategy::Spin;
-  std::vector<int> pin_to_cpus;            // optional: the CPU for each shard, in order (Linux only)
+  std::vector<int> pin_to_cpus = {};       // optional: the CPU for each shard, in order (Linux only)
 };
 
 // What became of a command handed to a ShardedEngine.
