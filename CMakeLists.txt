@@ -123,7 +123,8 @@ if(LOB_BUILD_TESTS)
     tests/spsc_ring_test.cpp
     tests/matching_engine_test.cpp
     tests/order_type_test.cpp
-    tests/thread_affinity_test.cpp)
+    tests/thread_affinity_test.cpp
+    tests/multi_symbol_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   gtest_discover_tests(lob_tests)
 

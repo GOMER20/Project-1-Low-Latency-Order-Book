@@ -10,11 +10,19 @@ namespace lob {
 enum class CommandType : std::uint8_t { Submit, Cancel };
 
 // A request sent to the engine thread.
+//
+// Exactly 32 bytes, so two commands fill one cache line and none straddles
+// two. To fit, a Submit's price and a Cancel's order ID share the same eight
+// bytes; a command only ever uses the one that belongs to its type. Measured
+// against a 40-byte layout with separate fields, this is a few percent faster.
 struct Command {
   std::uint64_t client_tag;  // chosen by the sender; echoed in every event the command causes
-  OrderId order_id;          // Cancel: the order to cancel
-  Price price;               // Submit: limit price
+  union {
+    Price price;             // Submit: limit price
+    OrderId order_id;        // Cancel: the order to cancel
+  };
   Quantity quantity;         // Submit: order quantity
+  SymbolId symbol;           // which book the command is for
   Side side;                 // Submit
   CommandType type;
   OrderType order_type;      // Submit: Limit, Market, IOC or FOK
@@ -25,10 +33,11 @@ static_assert(std::is_trivial_v<Command> && std::is_standard_layout_v<Command>);
 
 enum class EventType : std::uint8_t {
   Accepted,        // a Submit was taken; order_id is the ID the book gave it
-  Rejected,        // a Submit was refused: price out of range, zero quantity or book full
+  Rejected,        // a Submit was refused: unknown symbol, price out of range, zero
+                   // quantity or book full
   Trade,           // one fill between the command's order and a resting order
   Cancelled,       // a Cancel removed its order
-  CancelRejected,  // a Cancel named an order that is not live
+  CancelRejected,  // a Cancel named an order that is not live, or an unknown symbol
 };
 
 // Something the engine thread did in response to a command.
@@ -48,6 +57,7 @@ struct Event {
   Price price;               // Trade: the fill price. Accepted / Rejected: the limit price
   Quantity quantity;         // Trade: size of this fill. Accepted: total filled on arrival
   Quantity resting;          // Accepted: quantity left resting in the book
+  SymbolId symbol;           // the book the command was for
   Side side;                 // Submit events: the side of the command's order
   EventType type;
 };

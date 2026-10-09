@@ -13,9 +13,9 @@ unpredictable: it never allocates memory after start-up, never searches for an
 order or a price, and keeps each order in a single CPU cache line. On a laptop
 it inserts, cancels or matches an order in about 20 ns.
 
-The book itself is single-threaded. `MatchingEngine` runs it on a thread of its
-own, taking orders in and sending trades out through lock-free ring buffers, so
-no other thread can ever block it.
+A book is single-threaded and handles one symbol. `MatchingEngine` runs one book
+per symbol on a thread of its own, taking orders in and sending trades out
+through lock-free ring buffers, so no other thread can ever block it.
 
 ## Design
 
@@ -29,7 +29,7 @@ no other thread can ever block it.
 | `Trade` | [include/lob/trade.hpp](include/lob/trade.hpp) | The 40-byte event emitted for every fill. |
 | `SpscRing` | [include/lob/spsc_ring.hpp](include/lob/spsc_ring.hpp) | A wait-free queue between one producer thread and one consumer thread. Each side's counter has its own cache line, and each side caches the other's counter so it rarely reads it. |
 | `Command`, `Event` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings. |
-| `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | An `OrderBook` on its own thread, between a command ring and an event ring. The thread can be pinned to a CPU. |
+| `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | One `OrderBook` per symbol, all on one engine thread between a command ring and an event ring. The thread can be pinned to a CPU. |
 
 Design rules followed throughout:
 
@@ -83,36 +83,53 @@ A fill-or-kill order first checks that enough quantity is available. The check
 adds up each price level's running total and hops between occupied levels with
 the bitmap, so it never walks a queue of orders.
 
-### Running the book on its own thread
+### Running books on their own thread
 
-`MatchingEngine` owns a book and a thread. One thread sends it commands, and one
-thread (the same or another) reads the events that come back:
+`MatchingEngine` owns one book per symbol and a thread to run them on. One
+thread sends it commands, and one thread (the same or another) reads the events
+that come back:
 
 ```cpp
 #include "lob/matching_engine.hpp"
 
-lob::MatchingEngine engine({.book = {.symbol = "AAPL",
-                                     .min_price = 10'000,
-                                     .num_levels = 20'000,
-                                     .max_orders = 1 << 20}});
+lob::MatchingEngine engine({.books = {
+    {.symbol = "AAPL", .min_price = 10'000, .num_levels = 20'000, .max_orders = 1 << 20},
+    {.symbol = "MSFT", .min_price = 30'000, .num_levels = 20'000, .max_orders = 1 << 20},
+}});
+
+// A symbol's ID is its position in the list. Look it up once, not per order.
+const lob::SymbolId aapl = *engine.symbol_id("AAPL");
+
 engine.start();
 
 // Gateway thread. The tag (here 1) comes back on every event this order causes.
 // submit and cancel return false if the command ring is full.
-while (!engine.submit(1, lob::Side::Buy, 15'000, 100)) {
+while (!engine.submit(1, aapl, lob::Side::Buy, 15'000, 100)) {
 }
 
 // Publisher thread: everything the engine has reported so far, in order.
 engine.poll([&](const lob::Event& event) {
   // event.type is Accepted, Rejected, Trade, Cancelled or CancelRejected.
-  // An Accepted event carries the order's ID, which is what cancel() takes.
+  // event.symbol says which book it came from.
+  // An Accepted event carries the order's ID, which is what cancel() takes:
+  //   engine.cancel(2, event.symbol, event.order_id);
 });
 
 engine.stop();
 ```
 
+Every command is answered by exactly one `Accepted`, `Rejected`, `Cancelled` or
+`CancelRejected` event. An order that trades produces its `Trade` events first
+and its `Accepted` last.
+
+Books are independent: each has its own price range, capacity and order IDs.
+An order is therefore identified by its symbol and its order ID together, and a
+command for a symbol the engine does not have is answered with `Rejected` or
+`CancelRejected`. Routing a command to its book is one array index; there is no
+string comparison or hashing on the hot path.
+
 `submit` on the engine takes the same optional order type as the book:
-`engine.submit(2, lob::Side::Buy, 0, 500, lob::OrderType::Market)`.
+`engine.submit(2, aapl, lob::Side::Buy, 0, 500, lob::OrderType::Market)`.
 
 ### Pinning the engine thread to a core
 
@@ -120,7 +137,7 @@ On Linux, the engine thread can be bound to one CPU so the scheduler never
 moves it:
 
 ```cpp
-lob::MatchingEngine engine({.book = book_config, .pin_to_cpu = 3});
+lob::MatchingEngine engine({.books = {book_config}, .pin_to_cpu = 3});
 engine.start();
 if (!engine.pinned()) {
   // The CPU does not exist, is not available to this process, or the platform
@@ -130,10 +147,6 @@ if (!engine.pinned()) {
 
 Pinning only stops the engine from leaving that core. Keeping everything else
 off the core is a system setting, such as `isolcpus` or cpusets.
-
-Every command is answered by exactly one `Accepted`, `Rejected`, `Cancelled` or
-`CancelRejected` event. An order that trades produces its `Trade` events first
-and its `Accepted` last.
 
 `lob::SpscRing<T>` can also be used on its own, with `try_push`, `try_pop` and
 `drain`, for any trivially copyable `T`.
@@ -194,7 +207,8 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/model_test.cpp](tests/model_test.cpp) | 66,000 random operations, covering all four order types, compared step by step against a naive `std::map` reference book. |
 | [tests/allocation_test.cpp](tests/allocation_test.cpp) | Replaces global `operator new` and asserts that nothing allocates after construction. Built as its own binary and left out of sanitizer builds, whose runtimes replace `operator new` themselves. |
 | [tests/spsc_ring_test.cpp](tests/spsc_ring_test.cpp) | FIFO order, full and empty, wrap-around, and two-thread transfers that check nothing is lost, reordered or torn. |
-| [tests/matching_engine_test.cpp](tests/matching_engine_test.cpp) | Every event type, start, stop and restart, shutdown with nobody reading, and 5,000 random commands through 4-slot rings compared event for event against a single-threaded run. |
+| [tests/matching_engine_test.cpp](tests/matching_engine_test.cpp) | Every event type, start, stop and restart, shutdown with nobody reading, and 6,000 random commands for three books through 4-slot rings compared event for event against a single-threaded run. |
+| [tests/multi_symbol_test.cpp](tests/multi_symbol_test.cpp) | Routing by symbol, unknown symbols, per-book order IDs and limits, and 9,000 interleaved commands checked against running each symbol alone. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
 
@@ -223,7 +237,7 @@ To run only the headline numbers:
 | `BM_IntrusiveLevel_*`, `BM_StdList_*` | The intrusive queue against `std::list`. |
 | `BM_SpscRing_TwoThreads`, `BM_MutexRing_TwoThreads` | Time per `Trade` delivered from one thread to another, through the ring and through the same ring guarded by a mutex. |
 | `BM_Engine_RoundTrip` | One command sent to the engine thread and its answer received: both rings plus the book. |
-| `BM_Engine_Throughput` | Commands per second through the whole pipeline when the sender does not wait for answers. |
+| `BM_Engine_Throughput/N` | Commands per second through the whole pipeline when the sender does not wait for answers, with the orders spread over N symbols. |
 
 The deep-book benchmarks shuffle their orders first, so resting orders and free
 slots are scattered through memory rather than laid out in insertion order.
@@ -246,8 +260,8 @@ with other programs running: no core isolation, no pinning.
 | `BM_OrderPool_AllocateDeallocate` vs `BM_Heap_NewDelete` | 1.22 ns vs 181 ns |
 | `BM_IntrusiveLevel_AddCancel` vs `BM_StdList_AddCancel` | 2.33 ns vs 197 ns |
 | `BM_SpscRing_TwoThreads` vs `BM_MutexRing_TwoThreads` | 2.5 ns vs 106 ns per event (about 400 million vs 9 million events per second) |
-| `BM_Engine_RoundTrip` | about 250 ns from sending a command to receiving its answer |
-| `BM_Engine_Throughput` | 16 to 19 million commands per second |
+| `BM_Engine_RoundTrip` | about 275 ns from sending a command to receiving its answer |
+| `BM_Engine_Throughput/1`, `/8`, `/64` | about 12 million commands per second, the same with 1, 8 or 64 symbols |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
@@ -255,6 +269,8 @@ machine is; run them on the hardware you care about.
 ## Limits and trade-offs
 
 - **One symbol per book, one thread per book.** The book has no locks or atomics.
+- **One engine thread runs all of its symbols.** To use more cores, run several engines, each with its own symbols and rings. An engine holds at most 65,535 symbols.
+- **Order IDs are unique within a symbol, not across symbols.** A cancel must name both.
 - **The ring buffer is strictly one producer and one consumer.** A second thread on either side is a data race. It carries trivially copyable types only.
 - **The engine therefore takes commands from one thread and reports events to one thread.** Several gateways would each need their own ring.
 - **A slow event reader stalls the engine.** Events are never dropped while it runs, so a full event ring makes it wait. At shutdown only, events nobody is reading are discarded and counted, so that `stop()` always returns.
@@ -279,7 +295,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 8 — Engine thread between a command ring and an event ring
 - [x] Phase 9 — Market, IOC and FOK orders; core pinning for the engine thread
 - [x] Phase 10 — Continuous integration on Linux and macOS
-- [ ] Next — Multiple symbols
+- [x] Phase 11 — Multiple symbols on one engine
+- [ ] Next — Several engine threads, each with its own set of symbols
 
 ## Layout
 

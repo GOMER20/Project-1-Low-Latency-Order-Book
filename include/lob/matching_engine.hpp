@@ -5,8 +5,13 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "lob/compiler.hpp"
 #include "lob/messages.hpp"
@@ -24,18 +29,19 @@ enum class IdleStrategy : std::uint8_t {
 };
 
 struct EngineConfig {
-  BookConfig book;
+  std::vector<BookConfig> books;           // one per symbol; a symbol's ID is its position here
   std::size_t command_capacity = 1 << 16;  // inbound ring; rounded up to a power of two
   std::size_t event_capacity = 1 << 16;    // outbound ring; rounded up to a power of two
   IdleStrategy idle = IdleStrategy::Spin;
   int pin_to_cpu = kNoPinning;             // CPU to bind the engine thread to (Linux only)
 };
 
-// An order book running on its own thread, fed and read through two SPSC rings:
+// One order book per symbol, all running on a single engine thread that is fed
+// and read through two SPSC rings:
 //
-//   gateway thread --Command--> [ engine thread: OrderBook ] --Event--> publisher thread
+//   gateway thread --Command--> [ engine thread: OrderBooks ] --Event--> publisher thread
 //
-// The book stays single-threaded and lock-free; the rings are the only things
+// The books stay single-threaded and lock-free; the rings are the only things
 // shared between threads. Each ring allows exactly one thread on each end, so:
 //
 //   submit(), cancel()   one gateway thread
@@ -43,6 +49,13 @@ struct EngineConfig {
 //   start(), stop()      one controlling thread
 //
 // The gateway and publisher may be the same thread.
+//
+// A symbol is named by its SymbolId: its position in EngineConfig::books. That
+// makes routing a command to its book one array index, with no string
+// comparison or hashing on the hot path. Use symbol_id() to turn a name into
+// an ID once, up front. Books are independent: each has its own price range,
+// capacity and order IDs, so an order is identified by its symbol and its
+// order ID together.
 //
 // Events are never dropped while the engine is running: if the event ring is
 // full, the engine waits for the publisher. The one exception is shutdown, to
@@ -52,12 +65,20 @@ struct EngineConfig {
 // answered, then call stop().
 class MatchingEngine {
  public:
+  static constexpr std::size_t kMaxSymbols = std::numeric_limits<SymbolId>::max();
+
+  // All memory for every book and both rings is acquired here.
   explicit MatchingEngine(const EngineConfig& config)
-      : book_(config.book),
-        commands_(config.command_capacity),
+      : commands_(config.command_capacity),
         events_(config.event_capacity),
         idle_(config.idle),
-        pin_to_cpu_(config.pin_to_cpu) {}
+        pin_to_cpu_(config.pin_to_cpu) {
+    assert(!config.books.empty() && config.books.size() <= kMaxSymbols);
+    books_.reserve(config.books.size());
+    for (const BookConfig& book : config.books) {
+      books_.push_back(std::make_unique<OrderBook>(book));
+    }
+  }
 
   ~MatchingEngine() { stop(); }
 
@@ -96,26 +117,46 @@ class MatchingEngine {
   // the engine runs either way, so check this if pinning matters to you.
   [[nodiscard]] bool pinned() const noexcept { return pinned_.load(std::memory_order_acquire); }
 
+  // --- Symbols: any thread ---------------------------------------------------
+
+  [[nodiscard]] std::size_t symbol_count() const noexcept { return books_.size(); }
+
+  // The ID of the book with this symbol name, if there is one. A linear search
+  // over the names: do it once at start-up, not per order.
+  [[nodiscard]] std::optional<SymbolId> symbol_id(std::string_view name) const noexcept {
+    for (std::size_t index = 0; index < books_.size(); ++index) {
+      if (books_[index]->symbol() == name) {
+        return static_cast<SymbolId>(index);
+      }
+    }
+    return std::nullopt;
+  }
+
   // --- Gateway thread --------------------------------------------------------
   // Both return false if the command ring is full; the caller decides whether
-  // to retry.
+  // to retry. A command for a symbol the engine does not have is accepted here
+  // and answered with Rejected or CancelRejected.
 
-  [[nodiscard]] bool submit(std::uint64_t client_tag, Side side, Price price, Quantity quantity,
+  [[nodiscard]] bool submit(std::uint64_t client_tag, SymbolId symbol, Side side, Price price,
+                            Quantity quantity,
                             OrderType order_type = OrderType::Limit) noexcept {
     Command command{};
     command.client_tag = client_tag;
     command.price = price;
     command.quantity = quantity;
+    command.symbol = symbol;
     command.side = side;
     command.type = CommandType::Submit;
     command.order_type = order_type;
     return commands_.try_push(command);
   }
 
-  [[nodiscard]] bool cancel(std::uint64_t client_tag, OrderId order_id) noexcept {
+  [[nodiscard]] bool cancel(std::uint64_t client_tag, SymbolId symbol,
+                            OrderId order_id) noexcept {
     Command command{};
     command.client_tag = client_tag;
     command.order_id = order_id;
+    command.symbol = symbol;
     command.type = CommandType::Cancel;
     return commands_.try_push(command);
   }
@@ -156,7 +197,10 @@ class MatchingEngine {
   }
 
   // Only meaningful while the engine thread is not running.
-  [[nodiscard]] const OrderBook& book() const noexcept { return book_; }
+  [[nodiscard]] const OrderBook& book(SymbolId symbol) const noexcept {
+    assert(symbol < books_.size());
+    return *books_[symbol];
+  }
 
  private:
   void run() noexcept {
@@ -178,23 +222,32 @@ class MatchingEngine {
   }
 
   void handle(const Command& command) noexcept {
+    // Routing is one bounds check and one array index. A symbol the engine
+    // does not have gets no book, and the command is answered as refused.
+    OrderBook* const book =
+        command.symbol < books_.size() ? books_[command.symbol].get() : nullptr;
+
     Event event{};
     event.client_tag = command.client_tag;
+    event.symbol = command.symbol;
 
     if (command.type == CommandType::Submit) {
-      const SubmitResult result = book_.submit(
-          command.side, command.price, command.quantity, command.order_type,
-          [&](const Trade& trade) {
-            Event fill{};
-            fill.client_tag = command.client_tag;
-            fill.order_id = trade.taker_id;
-            fill.maker_id = trade.maker_id;
-            fill.price = trade.price;
-            fill.quantity = trade.quantity;
-            fill.side = trade.taker_side;
-            fill.type = EventType::Trade;
-            publish(fill);
-          });
+      SubmitResult result{kInvalidOrderId, 0, 0};
+      if (book != nullptr) [[likely]] {
+        result = book->submit(command.side, command.price, command.quantity, command.order_type,
+                              [&](const Trade& trade) {
+                                Event fill{};
+                                fill.client_tag = command.client_tag;
+                                fill.order_id = trade.taker_id;
+                                fill.maker_id = trade.maker_id;
+                                fill.price = trade.price;
+                                fill.quantity = trade.quantity;
+                                fill.symbol = command.symbol;
+                                fill.side = trade.taker_side;
+                                fill.type = EventType::Trade;
+                                publish(fill);
+                              });
+      }
       event.order_id = result.id;
       event.price = command.price;
       event.quantity = result.filled;
@@ -202,9 +255,9 @@ class MatchingEngine {
       event.side = command.side;
       event.type = result.id != kInvalidOrderId ? EventType::Accepted : EventType::Rejected;
     } else {
+      const bool cancelled = book != nullptr && book->cancel(command.order_id);
       event.order_id = command.order_id;
-      event.type =
-          book_.cancel(command.order_id) ? EventType::Cancelled : EventType::CancelRejected;
+      event.type = cancelled ? EventType::Cancelled : EventType::CancelRejected;
     }
     publish(event);
   }
@@ -220,7 +273,7 @@ class MatchingEngine {
     }
   }
 
-  OrderBook book_;
+  std::vector<std::unique_ptr<OrderBook>> books_;  // indexed by SymbolId
   SpscRing<Command> commands_;
   SpscRing<Event> events_;
   IdleStrategy idle_;

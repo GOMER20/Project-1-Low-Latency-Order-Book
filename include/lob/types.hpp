@@ -9,6 +9,7 @@ using OrderId = std::uint64_t;
 using Price = std::int64_t;        // integer ticks; never floating point
 using Quantity = std::uint32_t;
 using OrderIndex = std::uint32_t;  // slot number inside the OrderPool
+using SymbolId = std::uint16_t;    // which book: its position in the engine's list of books
 
 inline constexpr OrderIndex kNullIndex = std::numeric_limits<OrderIndex>::max();
 inline constexpr OrderId kInvalidOrderId = 0;
