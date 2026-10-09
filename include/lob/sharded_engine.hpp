@@ -17,6 +17,17 @@
 
 namespace lob {
 
+// What ShardedEngine::rebalance() counts as a symbol's load.
+enum class LoadMeasure : std::uint8_t {
+  // The number of commands handled for the symbol. Exact and repeatable, but
+  // it treats every command as equal work.
+  Commands,
+  // The time the engine has spent on the symbol's commands. It tells a symbol
+  // whose orders sweep many price levels from one whose orders just rest, but
+  // it is an estimate from a sample of commands, and a few percent noisier.
+  Time,
+};
+
 // When and how readily ShardedEngine::rebalance() moves a symbol.
 struct RebalanceConfig {
   // Look at the load after every this-many commands have been sent, from
@@ -31,6 +42,9 @@ struct RebalanceConfig {
 
   // Do not judge on fewer handled commands than this.
   std::uint64_t min_sample = 1'000;
+
+  // What to balance: commands handled, or time spent.
+  LoadMeasure measure = LoadMeasure::Commands;
 };
 
 struct ShardedConfig {
@@ -42,6 +56,7 @@ struct ShardedConfig {
   std::size_t event_capacity = 1 << 16;    // per shard
   IdleStrategy idle = IdleStrategy::Spin;
   std::vector<int> pin_to_cpus = {};       // optional: the CPU for each shard, in order (Linux only)
+  std::uint32_t time_one_in = 64;          // see EngineConfig::time_one_in; 0 turns timing off
 };
 
 // What became of a command handed to a ShardedEngine.
@@ -124,7 +139,7 @@ class ShardedEngine {
 
     // Working space for rebalance(), so that it never allocates.
     balance_.seen.assign(config.books.size(), 0);
-    balance_.handled.assign(config.books.size(), 0);
+    balance_.measured.assign(config.books.size(), 0);
     balance_.load.assign(config.books.size(), 0);
     balance_.proposed.assign(config.books.size(), 0);
     balance_.where.assign(config.books.size(), 0);
@@ -138,6 +153,7 @@ class ShardedEngine {
           .event_capacity = config.event_capacity,
           .idle = config.idle,
           .pin_to_cpu = config.pin_to_cpus.empty() ? kNoPinning : config.pin_to_cpus[shard],
+          .time_one_in = config.time_one_in,
       };
       shards_.push_back(
           std::make_unique<MatchingEngine>(shard_config, directory_, running[shard]));
@@ -308,9 +324,10 @@ class ShardedEngine {
   // been receiving. One call takes one look and starts at most one move;
   // returns the symbol it moved, if any.
   //
-  // A symbol's "load" is a running total of the commands handled for it, in
-  // which older traffic counts for less: at each look that reaches a decision,
-  // the total so far is cut by a quarter and what has arrived since is added.
+  // A symbol's "load" is a running total of the commands handled for it, or
+  // of the time spent on them if RebalanceConfig::measure says so. Older
+  // traffic counts for less: at each look that reaches a decision, the total
+  // so far is cut by a quarter and what has arrived since is added.
   // So a burst in one symbol does not by itself cause a move, while a lasting
   // shift shows up within a few looks.
   //
@@ -339,17 +356,24 @@ class ShardedEngine {
       balance_.moving = false;
     }
 
-    std::uint64_t sample = 0;
+    // Whatever is being balanced, there must have been enough commands since
+    // the last look for the picture to mean anything.
+    std::uint64_t commands = 0;
     for (std::size_t symbol = 0; symbol < books_.size(); ++symbol) {
-      balance_.handled[symbol] = commands_handled(static_cast<SymbolId>(symbol));
-      const std::uint64_t recent = balance_.handled[symbol] - balance_.seen[symbol];
+      commands += commands_handled(static_cast<SymbolId>(symbol));
+    }
+    if (commands - balance_.commands_seen < rebalance_.min_sample) {
+      return std::nullopt;  // too little to judge on: keep counting
+    }
+
+    const bool by_time = rebalance_.measure == LoadMeasure::Time;
+    for (std::size_t symbol = 0; symbol < books_.size(); ++symbol) {
+      const auto id = static_cast<SymbolId>(symbol);
+      balance_.measured[symbol] = by_time ? time_spent(id) : commands_handled(id);
+      const std::uint64_t recent = balance_.measured[symbol] - balance_.seen[symbol];
       // Older traffic fades: keep three quarters of the total, add what is new.
       balance_.proposed[symbol] = balance_.load[symbol] - balance_.load[symbol] / 4 + recent;
       balance_.where[symbol] = shard_of_[symbol].load(std::memory_order_relaxed);
-      sample += recent;
-    }
-    if (sample < rebalance_.min_sample) {
-      return std::nullopt;  // too little to judge on: keep counting
     }
 
     const std::optional<RebalancingMove> move = choose_rebalancing_move(
@@ -365,7 +389,8 @@ class ShardedEngine {
     }
     // The look counts: adopt the new totals, and measure afresh from here.
     balance_.load.swap(balance_.proposed);
-    balance_.seen.swap(balance_.handled);
+    balance_.seen.swap(balance_.measured);
+    balance_.commands_seen = commands;
     return move ? std::optional<SymbolId>(static_cast<SymbolId>(move->symbol)) : std::nullopt;
   }
 
@@ -451,13 +476,26 @@ class ShardedEngine {
     return total;
   }
 
-  // commands_handled() for every symbol, in symbol order: what each symbol
-  // actually received. Pass it as ShardedConfig::loads to balance the next
-  // engine on real traffic.
-  [[nodiscard]] std::vector<std::uint64_t> measured_loads() const {
+  // An estimate of how long the shards have spent on one symbol's commands so
+  // far, in cycle_ticks(). See MatchingEngine::time_spent().
+  [[nodiscard]] std::uint64_t time_spent(SymbolId symbol) const noexcept {
+    assert(symbol < books_.size());
+    std::uint64_t total = 0;
+    for (const auto& shard : shards_) {
+      total += shard->time_spent(symbol);
+    }
+    return total;
+  }
+
+  // Every symbol's load so far, in symbol order: commands handled, or time
+  // spent. Pass it as ShardedConfig::loads to balance the next engine on real
+  // traffic.
+  [[nodiscard]] std::vector<std::uint64_t> measured_loads(
+      LoadMeasure measure = LoadMeasure::Commands) const {
     std::vector<std::uint64_t> loads(books_.size());
     for (std::size_t symbol = 0; symbol < books_.size(); ++symbol) {
-      loads[symbol] = commands_handled(static_cast<SymbolId>(symbol));
+      const auto id = static_cast<SymbolId>(symbol);
+      loads[symbol] = measure == LoadMeasure::Time ? time_spent(id) : commands_handled(id);
     }
     return loads;
   }
@@ -481,12 +519,13 @@ class ShardedEngine {
   // Everything rebalance() needs between calls. Used only by the thread that
   // feeds the shards.
   struct Balance {
-    std::vector<std::uint64_t> seen;      // commands handled per symbol at the last decision
-    std::vector<std::uint64_t> handled;   // the same, as of this look
+    std::vector<std::uint64_t> seen;      // each symbol's measure at the last decision
+    std::vector<std::uint64_t> measured;  // the same, as of this look
     std::vector<std::uint64_t> load;      // each symbol's running total, older traffic fading
     std::vector<std::uint64_t> proposed;  // what those totals become if this look counts
     std::vector<std::uint16_t> where;     // each symbol's shard, as of this look
     std::vector<std::uint64_t> carried;   // each shard's load
+    std::uint64_t commands_seen = 0;      // commands handled in all, at the last decision
     std::uint64_t sent_since_look = 0;
     std::uint64_t moves_started = 0;
     SymbolId moved = 0;                  // the symbol rebalance() last moved

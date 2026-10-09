@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 
 namespace lob {
 
@@ -16,6 +18,25 @@ inline void cpu_relax() noexcept {
   __builtin_ia32_pause();
 #elif defined(__aarch64__) || defined(__arm__)
   __asm__ __volatile__("yield");
+#endif
+}
+
+// A cheap, steadily increasing counter for timing short stretches of work on
+// one thread. The unit is whatever the CPU's counter ticks in, so the values
+// are only good for comparing with each other, not for turning into seconds.
+//
+// Reading it costs a few nanoseconds: the CPU's own counter is read directly,
+// with no call into the operating system.
+[[nodiscard]] inline std::uint64_t cycle_ticks() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+  return __builtin_ia32_rdtsc();
+#elif defined(__aarch64__)
+  std::uint64_t ticks;
+  __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(ticks));
+  return ticks;
+#else
+  return static_cast<std::uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
 #endif
 }
 

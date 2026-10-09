@@ -505,6 +505,20 @@ TEST(ShardedThreads, EverySymbolBehavesAsIfAloneWhenAssignedByLoad) {
   (void)expect_every_symbol_to_behave_as_if_alone({900, 10, 10, 800, 10, 700, 10});
 }
 
+// And once more with the engine balancing on time spent rather than commands
+// counted. What it decides to move depends on the clock, so nothing is
+// claimed about that here: only that whatever it does, every symbol still
+// behaves as if alone.
+TEST(ShardedThreads, EverySymbolBehavesAsIfAloneWhileRebalancingByTimeSpent) {
+  (void)expect_every_symbol_to_behave_as_if_alone(
+      {},
+      {.every = 200,
+       .tolerance_percent = 10,
+       .min_sample = 100,
+       .measure = lob::LoadMeasure::Time},
+      /*lopsided=*/true);
+}
+
 // --- Assigning symbols to shards by load -------------------------------------------
 
 // Symbols 0 and 2 are the busy ones. Dealt in turn they would share shard 0.

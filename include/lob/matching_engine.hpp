@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <concepts>
@@ -35,7 +36,36 @@ struct EngineConfig {
   std::size_t event_capacity = 1 << 16;    // outbound ring; rounded up to a power of two
   IdleStrategy idle = IdleStrategy::Spin;
   int pin_to_cpu = kNoPinning;             // CPU to bind the engine thread to (Linux only)
+
+  // Time one command in this many, on average, to estimate how long each
+  // symbol's commands take; see time_spent(). 0 turns timing off.
+  std::uint32_t time_one_in = 64;
 };
+
+// Decides how much of one timed command to count, and keeps `typical_x256` up
+// to date: a running average of what a timed command takes, held as 256 times
+// its value so that it stays meaningful on clocks so coarse that most commands
+// measure as zero or one tick.
+//
+// A sample is capped at 64 times that average. Now and then the thread is
+// interrupted in the middle of a timed command, and the stopwatch reads
+// thousands of times too long; uncapped, one such reading would pass for a
+// great deal of work. A symbol whose commands really are that expensive is
+// not held down for long, because each capped sample still pulls the average
+// up, by a factor of nearly five, and within a few samples its commands are
+// counted in full.
+[[nodiscard]] inline std::uint64_t cap_timed_sample(std::uint64_t elapsed,
+                                                    std::uint64_t& typical_x256) noexcept {
+  if (typical_x256 == 0) {
+    typical_x256 = elapsed * 256;  // nothing to compare with yet
+    return elapsed;
+  }
+  const std::uint64_t ceiling = std::max<std::uint64_t>(typical_x256 / 4, 1);  // 64 x typical
+  const std::uint64_t counted = std::min(elapsed, ceiling);
+  // Move the average a sixteenth of the way towards this sample.
+  typical_x256 = typical_x256 - typical_x256 / 16 + counted * 16;
+  return counted;
+}
 
 // The three milestones of moving one symbol from one engine to another. Each
 // holds the number of the latest move to have reached it; the moves of a
@@ -91,10 +121,13 @@ class MatchingEngine {
   explicit MatchingEngine(const EngineConfig& config)
       : books_(config.books.size(), nullptr),
         handled_(config.books.size()),
+        timed_(config.books.size()),
         commands_(config.command_capacity),
         events_(config.event_capacity),
         idle_(config.idle),
-        pin_to_cpu_(config.pin_to_cpu) {
+        pin_to_cpu_(config.pin_to_cpu),
+        time_one_in_(config.time_one_in),
+        sample_countdown_(config.time_one_in != 0 ? 1 : 0) {
     assert(!config.books.empty() && config.books.size() <= kMaxSymbols);
     owned_.reserve(config.books.size());
     for (std::size_t symbol = 0; symbol < config.books.size(); ++symbol) {
@@ -111,11 +144,14 @@ class MatchingEngine {
                  std::span<const SymbolId> running)
       : books_(directory.books.size(), nullptr),
         handled_(directory.books.size()),
+        timed_(directory.books.size()),
         directory_(&directory),
         commands_(config.command_capacity),
         events_(config.event_capacity),
         idle_(config.idle),
-        pin_to_cpu_(config.pin_to_cpu) {
+        pin_to_cpu_(config.pin_to_cpu),
+        time_one_in_(config.time_one_in),
+        sample_countdown_(config.time_one_in != 0 ? 1 : 0) {
     for (const SymbolId symbol : running) {
       books_[symbol] = directory.books[symbol];
     }
@@ -256,18 +292,24 @@ class MatchingEngine {
   // It stops early at an Attach whose symbol has not been handed over yet,
   // leaving that command and everything behind it queued for the next call.
   std::size_t process_pending() noexcept {
-    // Counted in a local, not a member: a member would be written to memory
-    // once per command, which measurably slows the engine thread.
+    // Both of these live in locals while the batch runs, not in members: a
+    // member would be written to memory once per command, which measurably
+    // slows the engine thread.
     std::uint64_t orders = 0;
+    std::uint32_t countdown = sample_countdown_;
     const std::size_t count = commands_.drain_while([&](const Command& command) {
-      if (!handle(command)) {
-        return false;
-      }
-      if (command.type == CommandType::Submit || command.type == CommandType::Cancel) {
+      if (command.type == CommandType::Submit || command.type == CommandType::Cancel) [[likely]] {
+        if (--countdown != 0) [[likely]] {
+          handle_order(command);
+        } else {
+          countdown = handle_order_timed(command);
+        }
         ++orders;
+        return true;
       }
-      return true;
+      return handle_migration(command);
     });
+    sample_countdown_ = countdown;
     if (orders != 0) {
       commands_processed_.store(commands_processed_.load(std::memory_order_relaxed) + orders,
                                 std::memory_order_release);
@@ -291,6 +333,20 @@ class MatchingEngine {
   [[nodiscard]] std::uint64_t commands_handled(SymbolId symbol) const noexcept {
     assert(symbol < handled_.size());
     return handled_[symbol].load(std::memory_order_relaxed);
+  }
+
+  // An estimate of how long the engine has spent handling one symbol's
+  // commands, in cycle_ticks(). Unlike commands_handled(), it tells an order
+  // that sweeps fifty price levels apart from one that just rests.
+  //
+  // It is an estimate because only one command in EngineConfig::time_one_in is
+  // timed, and the total is scaled up from those. That keeps the cost on the
+  // hot path to a countdown. A timed command that had to wait for the event
+  // ring is left out, and one that took wildly longer than usual is capped;
+  // see cap_timed_sample(). Always 0 if timing is off.
+  [[nodiscard]] std::uint64_t time_spent(SymbolId symbol) const noexcept {
+    assert(symbol < timed_.size());
+    return timed_[symbol].load(std::memory_order_relaxed) * time_one_in_;
   }
 
   // Only meaningful while the engine thread is not running, and only for a
@@ -344,19 +400,36 @@ class MatchingEngine {
   }
 
   // Returns false if the command cannot be handled yet and must stay queued.
-  bool handle(const Command& command) noexcept {
-    switch (command.type) {
-      case CommandType::Submit:
-      case CommandType::Cancel:
-        handle_order(command);
-        return true;
-      case CommandType::Detach:
-        handle_detach(command);
-        return true;
-      case CommandType::Attach:
-        return handle_attach(command);
+  bool handle_migration(const Command& command) noexcept {
+    if (command.type == CommandType::Detach) {
+      handle_detach(command);
+      return true;
     }
-    return true;
+    return command.type != CommandType::Attach || handle_attach(command);
+  }
+
+  // Handles one command with a stopwatch on it, and returns how many commands
+  // to let pass before the next one is timed.
+  //
+  // The gap is random, between 1 and twice the configured average, rather
+  // than fixed. A fixed gap could fall into step with a pattern in the order
+  // flow and keep timing the same symbol.
+  std::uint32_t handle_order_timed(const Command& command) noexcept {
+    waited_while_timing_ = false;
+    const std::uint64_t before = cycle_ticks();
+    handle_order(command);
+    const std::uint64_t elapsed = cycle_ticks() - before;
+
+    // Time spent waiting for a full event ring says how slow the reader is,
+    // not how much work the symbol is, so such a sample is thrown away.
+    if (!waited_while_timing_ && command.symbol < timed_.size()) {
+      const std::uint64_t counted = cap_timed_sample(elapsed, typical_sample_x256_);
+      std::atomic<std::uint64_t>& timed = timed_[command.symbol];
+      timed.store(timed.load(std::memory_order_relaxed) + counted, std::memory_order_relaxed);
+    }
+
+    sample_random_ = sample_random_ * 6364136223846793005ULL + 1442695040888963407ULL;
+    return 1 + static_cast<std::uint32_t>((sample_random_ >> 33) % (2 * time_one_in_ - 1));
   }
 
   void handle_order(const Command& command) noexcept {
@@ -455,6 +528,7 @@ class MatchingEngine {
   // engine is not running, or is shutting down.
   bool publish(const Event& event, bool count_if_discarded = true) noexcept {
     while (!events_.try_push(event)) {
+      waited_while_timing_ = true;
       if (stop_requested_.load(std::memory_order_acquire)) {
         if (count_if_discarded) {
           events_dropped_.store(events_dropped_.load(std::memory_order_relaxed) + 1,
@@ -471,11 +545,24 @@ class MatchingEngine {
   std::vector<OrderBook*> books_;                    // the book it runs for each SymbolId, or
                                                      // nullptr; changed only by the engine thread
   std::vector<std::atomic<std::uint64_t>> handled_;  // commands handled, per symbol
+  std::vector<std::atomic<std::uint64_t>> timed_;    // ticks spent on the timed ones, per symbol
   SymbolDirectory* directory_ = nullptr;             // set only for a member of a group
   SpscRing<Command> commands_;
   SpscRing<Event> events_;
   IdleStrategy idle_;
   int pin_to_cpu_;
+  std::uint32_t time_one_in_;
+
+  // Touched only by whichever thread is running the engine. The countdown is
+  // read and written once per batch; the rest only when a command is timed.
+  //
+  // With timing off the countdown starts at zero, so counting down wraps it
+  // round instead of ever reaching zero, and no command is timed. (Strictly,
+  // one is every four billion; time_spent() still reports nothing.)
+  std::uint32_t sample_countdown_;  // commands still to pass before the next timed one
+  std::uint64_t sample_random_ = 0x9E3779B97F4A7C15ULL;
+  std::uint64_t typical_sample_x256_ = 0;  // see cap_timed_sample()
+  bool waited_while_timing_ = false;  // the timed command had to wait for the event ring
 
   // Touched only by whichever thread is running the engine, and only when a
   // symbol is changing hands.

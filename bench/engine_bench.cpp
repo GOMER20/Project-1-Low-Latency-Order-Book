@@ -96,4 +96,37 @@ void BM_Engine_Throughput(benchmark::State& state) {
 }
 BENCHMARK(BM_Engine_Throughput)->Arg(1)->Arg(8)->Arg(64)->UseRealTime();
 
+// The engine's own cost per command, with no second thread involved: this
+// thread sends 256 orders, runs the engine, reads the answers, then cancels
+// them all the same way.
+//
+// The argument is EngineConfig::time_one_in, to show what timing commands
+// costs: 0 is no timing, 64 the default, and 1 a stopwatch on every command.
+void BM_Engine_PerCommand(benchmark::State& state) {
+  constexpr int kBatch = 256;
+  lob::MatchingEngine engine(
+      {.books = {kBook}, .time_one_in = static_cast<std::uint32_t>(state.range(0))});
+  std::vector<OrderId> resting;
+  resting.reserve(kBatch);
+  std::uint64_t tag = 0;
+
+  for (auto _ : state) {
+    for (int i = 0; i < kBatch; ++i) {
+      bool sent = engine.submit(tag++, 0, Side::Buy, kPrice, 100);
+      benchmark::DoNotOptimize(sent);
+    }
+    engine.process_pending();
+    engine.poll([&](const Event& event) { resting.push_back(event.order_id); });
+    for (const OrderId id : resting) {
+      bool sent = engine.cancel(tag++, 0, id);
+      benchmark::DoNotOptimize(sent);
+    }
+    engine.process_pending();
+    engine.poll([](const Event&) {});
+    resting.clear();
+  }
+  state.SetItemsProcessed(state.iterations() * 2 * kBatch);
+}
+BENCHMARK(BM_Engine_PerCommand)->Arg(0)->Arg(64)->Arg(1);
+
 }  // namespace
