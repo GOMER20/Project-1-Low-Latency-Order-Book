@@ -30,6 +30,7 @@ through lock-free ring buffers, so no other thread can ever block it.
 | `SpscRing` | [include/lob/spsc_ring.hpp](include/lob/spsc_ring.hpp) | A wait-free queue between one producer thread and one consumer thread. Each side's counter has its own cache line, and each side caches the other's counter so it rarely reads it. |
 | `Command`, `Event` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings. |
 | `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | One `OrderBook` per symbol, all on one engine thread between a command ring and an event ring. The thread can be pinned to a CPU. |
+| `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread, rings and share of the symbols, to use more than one core. |
 
 Design rules followed throughout:
 
@@ -151,6 +152,39 @@ off the core is a system setting, such as `isolcpus` or cpusets.
 `lob::SpscRing<T>` can also be used on its own, with `try_push`, `try_pop` and
 `drain`, for any trivially copyable `T`.
 
+### Using more than one core
+
+One engine thread runs all of its books, so it uses one core. `ShardedEngine`
+runs several engines side by side and deals the symbols out among them:
+
+```cpp
+#include "lob/sharded_engine.hpp"
+
+lob::ShardedEngine engine({.books = books,                  // e.g. 400 symbols
+                           .shards = 4,                     // four engine threads
+                           .pin_to_cpus = {2, 3, 4, 5}});   // optional, Linux only
+engine.start();
+
+const lob::SymbolId aapl = *engine.symbol_id("AAPL");
+if (engine.submit(1, aapl, lob::Side::Buy, 15'000, 100) == lob::SendStatus::RingFull) {
+  // That symbol's shard is busy: try again.
+}
+
+engine.poll([&](const lob::Event& event) { /* events from every shard */ });
+```
+
+Symbol IDs are the same whatever the number of shards; a small table turns an
+ID into its shard, so routing is still one array lookup. Shards share nothing:
+there is no lock, and no cache line that two engine threads both write.
+
+Two things differ from a single engine:
+
+- **Threads.** Each shard's rings still take one thread on each end. One thread
+  may feed every shard, or each shard may have a feeder of its own; the same
+  goes for reading events with `poll(shard, ...)`.
+- **Order.** Events for one symbol arrive in the order they happened. Events
+  for symbols on different shards have no order relative to each other.
+
 ## Build
 
 Dependencies on Ubuntu or WSL:
@@ -209,6 +243,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/spsc_ring_test.cpp](tests/spsc_ring_test.cpp) | FIFO order, full and empty, wrap-around, and two-thread transfers that check nothing is lost, reordered or torn. |
 | [tests/matching_engine_test.cpp](tests/matching_engine_test.cpp) | Every event type, start, stop and restart, shutdown with nobody reading, and 6,000 random commands for three books through 4-slot rings compared event for event against a single-threaded run. |
 | [tests/multi_symbol_test.cpp](tests/multi_symbol_test.cpp) | Routing by symbol, unknown symbols, per-book order IDs and limits, and 9,000 interleaved commands checked against running each symbol alone. |
+| [tests/sharded_engine_test.cpp](tests/sharded_engine_test.cpp) | How symbols are dealt to shards, routing and symbol IDs, one feeder thread per shard, and 12,000 random commands through three shard threads compared, symbol by symbol, with each symbol running alone. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
 
@@ -238,6 +273,7 @@ To run only the headline numbers:
 | `BM_SpscRing_TwoThreads`, `BM_MutexRing_TwoThreads` | Time per `Trade` delivered from one thread to another, through the ring and through the same ring guarded by a mutex. |
 | `BM_Engine_RoundTrip` | One command sent to the engine thread and its answer received: both rings plus the book. |
 | `BM_Engine_Throughput/N` | Commands per second through the whole pipeline when the sender does not wait for answers, with the orders spread over N symbols. |
+| `BM_Sharded_Throughput/N` | Total commands per second across N shards, each with its own feeder thread: 2N busy threads in all. |
 
 The deep-book benchmarks shuffle their orders first, so resting orders and free
 slots are scattered through memory rather than laid out in insertion order.
@@ -262,6 +298,7 @@ with other programs running: no core isolation, no pinning.
 | `BM_SpscRing_TwoThreads` vs `BM_MutexRing_TwoThreads` | 2.5 ns vs 106 ns per event (about 400 million vs 9 million events per second) |
 | `BM_Engine_RoundTrip` | about 275 ns from sending a command to receiving its answer |
 | `BM_Engine_Throughput/1`, `/8`, `/64` | about 12 million commands per second, the same with 1, 8 or 64 symbols |
+| `BM_Sharded_Throughput/1`, `/2`, `/4` | about 1.6 times the throughput of one shard with two, and about 2.7 times with four. Measured later, with the laptop busy and running hot, so only the ratios are given. Four shards means eight busy threads on its eight cores. |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
@@ -269,7 +306,9 @@ machine is; run them on the hardware you care about.
 ## Limits and trade-offs
 
 - **One symbol per book, one thread per book.** The book has no locks or atomics.
-- **One engine thread runs all of its symbols.** To use more cores, run several engines, each with its own symbols and rings. An engine holds at most 65,535 symbols.
+- **One engine thread runs all of its symbols.** `ShardedEngine` uses more cores by running several engines, each with its own symbols and rings. An engine holds at most 65,535 symbols.
+- **Symbols are dealt to shards in turn, not by load.** A few very busy symbols can land on the same shard. A symbol never moves between shards.
+- **There is no ordering between shards.** Events for one symbol are in order; events for symbols on different shards are not ordered relative to each other.
 - **Order IDs are unique within a symbol, not across symbols.** A cancel must name both.
 - **The ring buffer is strictly one producer and one consumer.** A second thread on either side is a data race. It carries trivially copyable types only.
 - **The engine therefore takes commands from one thread and reports events to one thread.** Several gateways would each need their own ring.
@@ -296,7 +335,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 9 — Market, IOC and FOK orders; core pinning for the engine thread
 - [x] Phase 10 — Continuous integration on Linux and macOS
 - [x] Phase 11 — Multiple symbols on one engine
-- [ ] Next — Several engine threads, each with its own set of symbols
+- [x] Phase 12 — Several engine threads, each with its own share of the symbols
+- [ ] Next — Assigning symbols to shards by load
 
 ## Layout
 

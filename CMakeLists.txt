@@ -124,7 +124,8 @@ if(LOB_BUILD_TESTS)
     tests/matching_engine_test.cpp
     tests/order_type_test.cpp
     tests/thread_affinity_test.cpp
-    tests/multi_symbol_test.cpp)
+    tests/multi_symbol_test.cpp
+    tests/sharded_engine_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   gtest_discover_tests(lob_tests)
 
@@ -162,6 +163,7 @@ if(LOB_BUILD_BENCHMARKS)
     bench/price_level_bench.cpp
     bench/order_pool_bench.cpp
     bench/spsc_ring_bench.cpp
-    bench/engine_bench.cpp)
+    bench/engine_bench.cpp
+    bench/sharded_engine_bench.cpp)
   target_link_libraries(lob_bench PRIVATE benchmark::benchmark_main)
 endif()
