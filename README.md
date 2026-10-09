@@ -31,7 +31,7 @@ through lock-free ring buffers, so no other thread can ever block it.
 | `Command`, `Event` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings. |
 | `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | One `OrderBook` per symbol, all on one engine thread between a command ring and an event ring. The thread can be pinned to a CPU. |
 | `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread and rings, to use more than one core. It owns every book, decides which shard runs each symbol, and can move a symbol to another shard while running. |
-| `assign_shards` | [include/lob/shard_assignment.hpp](include/lob/shard_assignment.hpp) | Decides which shard each symbol gets from how busy each is expected to be, so that the shards carry similar totals. |
+| `assign_shards`, `choose_rebalancing_move` | [include/lob/shard_assignment.hpp](include/lob/shard_assignment.hpp) | The two placement decisions: which shard each symbol starts on, given how busy each is expected to be, and which single symbol to move when the shards have drifted out of balance. |
 
 Design rules followed throughout:
 
@@ -228,6 +228,34 @@ How the handover stays correct:
 
 Call `move_symbol` from the thread that feeds both shards involved.
 
+The engine can also decide the moves itself. Ask it to look at the load every
+so many commands, and it will move a symbol whenever one shard is carrying
+clearly more than its share:
+
+```cpp
+lob::ShardedEngine engine({.books = books,
+                           .shards = 4,
+                           .rebalance = {.every = 100'000}});  // look every 100,000 commands
+```
+
+Each look measures how many commands every symbol has received, with older
+traffic counting for less, and adds up what each shard is carrying. Then:
+
+- **If the busiest shard is within 25% of its fair share, nothing moves.** The
+  tolerance is configurable. A move pauses a shard, so small differences are
+  not worth one.
+- **Otherwise one symbol moves from the busiest shard to the quietest:** the
+  one that narrows the gap between them the most.
+- **A move must at least halve that gap.** That rules out symbols too quiet to
+  matter and symbols so busy that moving them would only move the problem.
+- **Only one move is under way at a time.**
+
+Because older traffic fades rather than vanishes, a single burst does not cause
+a move, but a lasting shift is acted on within a few looks. To decide the
+timing yourself, leave `every` at zero and call `engine.rebalance()` when it
+suits you. Either way it must run on the thread that feeds every shard, so turn
+`every` on only if one thread does.
+
 Two things differ from a single engine:
 
 - **Threads.** Each shard's rings still take one thread on each end. One thread
@@ -298,6 +326,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/sharded_engine_test.cpp](tests/sharded_engine_test.cpp) | How symbols are dealt to shards, routing and symbol IDs, one feeder thread per shard, and 12,000 random commands through three shard threads compared, symbol by symbol, with each symbol running alone. |
 | [tests/shard_assignment_test.cpp](tests/shard_assignment_test.cpp) | Equal loads dealt in turn, busy symbols kept apart, no shard left empty, and 400 random cases checked against the best possible split. |
 | [tests/symbol_move_test.cpp](tests/symbol_move_test.cpp) | Moving a symbol between shards: orders and IDs survive, events stay in order, queued and repeated moves, full rings, stopping or destroying the engine mid-move, and 12,000 random commands with hundreds of random moves compared, symbol by symbol, with each symbol running alone. |
+| [tests/rebalance_test.cpp](tests/rebalance_test.cpp) | The rebalancing decision on its own, including 300 random cases showing that repeated moves only ever improve things and always stop; and the engine moving a busy symbol off an overloaded shard, settling, following a shift in traffic, and doing it all unprompted. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
 
@@ -329,6 +358,7 @@ To run only the headline numbers:
 | `BM_Engine_Throughput/N` | Commands per second through the whole pipeline when the sender does not wait for answers, with the orders spread over N symbols. |
 | `BM_Sharded_Throughput/N` | Total commands per second across N shards, each with its own feeder thread: 2N busy threads in all. |
 | `BM_Sharded_MoveSymbol` | How long one move takes between two otherwise idle shards. |
+| `BM_Sharded_RebalanceLook/N` | What one look by `rebalance()` costs with N symbols on four shards. |
 
 The deep-book benchmarks shuffle their orders first, so resting orders and free
 slots are scattered through memory rather than laid out in insertion order.
@@ -355,6 +385,7 @@ with other programs running: no core isolation, no pinning.
 | `BM_Engine_Throughput/1`, `/8`, `/64` | 12 to 13 million commands per second, the same with 1, 8 or 64 symbols |
 | `BM_Sharded_Throughput/1`, `/2`, `/4` | 9 to 15 million commands per second with one shard; roughly 1.2 to 1.6 times that with two and 1.8 to 2.7 times with four. These readings vary a lot from run to run: four shards means eight busy threads on this laptop's eight cores. |
 | `BM_Sharded_MoveSymbol` | about 450 to 530 ns per move |
+| `BM_Sharded_RebalanceLook/16`, `/256`, `/4096` | about 85 ns, 1.1 µs and 18 µs per look. At one look per 100,000 commands with 256 symbols, that is about a hundredth of a nanosecond per command. |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
@@ -363,7 +394,10 @@ machine is; run them on the hardware you care about.
 
 - **One symbol per book, one thread per book.** The book has no locks or atomics.
 - **One engine thread runs all of its symbols.** `ShardedEngine` uses more cores by running several engines, each with its own symbols and rings. An engine holds at most 65,535 symbols.
-- **Nothing rebalances the shards for you.** Symbols are dealt in turn, or by the loads you supply, at start-up. After that a symbol moves only when you call `move_symbol`.
+- **Rebalancing is off unless you ask for it.** Symbols are dealt in turn, or by the loads you supply, at start-up. After that a symbol moves only when you call `move_symbol` or `rebalance`, or set `RebalanceConfig::every`.
+- **Rebalancing is cautious, not optimal.** It moves one symbol at a time, from the busiest shard to the quietest, and only if that at least halves the gap between them. It will not split up two shards that are each dominated by one busy symbol, and it only ever compares the busiest shard with the quietest.
+- **Automatic rebalancing needs a single feeder thread.** It runs inside `submit` and `cancel` and may move a symbol, which only the thread feeding every shard may do. With a feeder thread per shard, leave it off.
+- **Load means commands handled.** A symbol whose orders are expensive to match counts the same as one whose orders are cheap.
 - **A move pauses its destination.** The new shard waits, for all of its symbols, until the old shard has worked through its queue and `poll` has read its events. Idle shards hand over in about half a microsecond; a backlog on the old shard, or a slow reader, makes it longer.
 - **A move needs the events to be read.** If nothing calls `poll`, a move does not finish until the engine is stopped. If the engine is stopped mid-move, the move still completes, but the symbol's events from either side of it may then be read out of order.
 - **`move_symbol` must be called by the thread that feeds both shards.** If each shard has its own feeder thread, both must pause for the call.
@@ -398,7 +432,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 12 — Several engine threads, each with its own share of the symbols
 - [x] Phase 13 — Assigning symbols to shards by expected or measured load
 - [x] Phase 14 — Moving a symbol between shards while the engine is running
-- [ ] Next — Rebalancing automatically from measured load
+- [x] Phase 15 — Rebalancing automatically from measured load
+- [ ] Next — Measuring load by time spent rather than commands handled
 
 ## Layout
 

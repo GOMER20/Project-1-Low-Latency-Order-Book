@@ -128,4 +128,22 @@ void BM_Sharded_MoveSymbol(benchmark::State& state) {
 }
 BENCHMARK(BM_Sharded_MoveSymbol)->UseRealTime();
 
+// What one look by rebalance() costs: reading every symbol's counter on every
+// shard, working out each shard's load and deciding. The argument is the
+// number of symbols, spread over four shards. The shards are idle and even, so
+// no move is ever started.
+void BM_Sharded_RebalanceLook(benchmark::State& state) {
+  const auto symbols = static_cast<std::size_t>(state.range(0));
+  const lob::BookConfig small_book{
+      .symbol = "BENCH", .min_price = 0, .num_levels = 64, .max_orders = 16};
+  lob::ShardedEngine engine({.books = std::vector<lob::BookConfig>(symbols, small_book),
+                             .shards = 4,
+                             .rebalance = {.min_sample = 0}});
+  for (auto _ : state) {
+    auto moved = engine.rebalance();
+    benchmark::DoNotOptimize(moved);
+  }
+}
+BENCHMARK(BM_Sharded_RebalanceLook)->Arg(16)->Arg(256)->Arg(4096);
+
 }  // namespace
