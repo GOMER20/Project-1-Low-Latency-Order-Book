@@ -12,12 +12,14 @@
 #include <vector>
 
 #include "lob/matching_engine.hpp"
+#include "lob/shard_assignment.hpp"
 
 namespace lob {
 
 struct ShardedConfig {
   std::vector<BookConfig> books;           // one per symbol; a symbol's ID is its position here
   std::size_t shards = 1;                  // engine threads; never more than there are symbols
+  std::vector<std::uint64_t> loads = {};   // optional: how busy each symbol is expected to be
   std::size_t command_capacity = 1 << 16;  // per shard
   std::size_t event_capacity = 1 << 16;    // per shard
   IdleStrategy idle = IdleStrategy::Spin;
@@ -42,10 +44,17 @@ enum class SendStatus : std::uint8_t {
 // nothing, so there is still no lock anywhere and no cache line that two
 // engine threads both write.
 //
-// Symbols are dealt to the shards in turn: symbol 0 to shard 0, symbol 1 to
-// shard 1, and so on round the shards. Callers use one set of symbol IDs for
-// the whole group; a small table turns an ID into its shard and its position
-// there, so routing is still one array lookup.
+// Which shard a symbol gets is decided once, in the constructor. By default
+// the symbols are dealt in turn: symbol 0 to shard 0, symbol 1 to shard 1, and
+// so on round the shards. If ShardedConfig::loads says how busy each symbol is
+// expected to be, the busy ones are spread out so that every shard carries a
+// similar total; see assign_shards(). measured_loads() reports what each
+// symbol actually received, ready to be used as the loads for the next run.
+// A symbol does not move between shards while the engine exists.
+//
+// Callers use one set of symbol IDs for the whole group; a small table turns
+// an ID into its shard and its position there, so routing is still one array
+// lookup.
 //
 // Threads. Every ring still has exactly one thread on each end, so:
 //
@@ -64,16 +73,27 @@ class ShardedEngine {
         std::clamp<std::size_t>(config.shards, 1, config.books.size());
     assert(config.pin_to_cpus.empty() || config.pin_to_cpus.size() >= shard_count);
 
-    // Deal the symbols round the shards, remembering both directions.
+    // With no loads given, every symbol counts the same, which deals them out
+    // in turn.
+    assert(config.loads.empty() || config.loads.size() == config.books.size());
+    const std::vector<std::uint64_t> loads =
+        config.loads.size() == config.books.size()
+            ? config.loads
+            : std::vector<std::uint64_t>(config.books.size(), 1);
+    const std::vector<std::uint16_t> shard_for = assign_shards(loads, shard_count);
+
+    // Give each shard its books, remembering the mapping in both directions.
     std::vector<std::vector<BookConfig>> books_of(shard_count);
     global_of_.resize(shard_count);
+    shard_loads_.assign(shard_count, 0);
     routes_.reserve(config.books.size());
     for (std::size_t symbol = 0; symbol < config.books.size(); ++symbol) {
-      const std::size_t shard = symbol % shard_count;
+      const std::size_t shard = shard_for[symbol];
       routes_.push_back({static_cast<std::uint16_t>(shard),
                          static_cast<SymbolId>(books_of[shard].size())});
       books_of[shard].push_back(config.books[symbol]);
       global_of_[shard].push_back(static_cast<SymbolId>(symbol));
+      shard_loads_[shard] += loads[symbol];
     }
 
     shards_.reserve(shard_count);
@@ -119,6 +139,13 @@ class ShardedEngine {
   [[nodiscard]] std::size_t shard_of(SymbolId symbol) const noexcept {
     assert(symbol < routes_.size());
     return routes_[symbol].shard;
+  }
+
+  // The total expected load that was assigned to a shard: the sum of
+  // ShardedConfig::loads over its symbols, or simply how many symbols it has
+  // if no loads were given.
+  [[nodiscard]] std::uint64_t shard_load(std::size_t shard) const noexcept {
+    return shard_loads_[shard];
   }
 
   // The ID of the symbol with this name, if there is one. Do it once at
@@ -214,6 +241,24 @@ class ShardedEngine {
     return total;
   }
 
+  // How many commands have been handled for one symbol so far.
+  [[nodiscard]] std::uint64_t commands_handled(SymbolId symbol) const noexcept {
+    assert(symbol < routes_.size());
+    const Route route = routes_[symbol];
+    return shards_[route.shard]->commands_handled(route.local);
+  }
+
+  // commands_handled() for every symbol, in symbol order: what each symbol
+  // actually received. Pass it as ShardedConfig::loads to balance the next
+  // engine on real traffic.
+  [[nodiscard]] std::vector<std::uint64_t> measured_loads() const {
+    std::vector<std::uint64_t> loads(routes_.size());
+    for (std::size_t symbol = 0; symbol < routes_.size(); ++symbol) {
+      loads[symbol] = commands_handled(static_cast<SymbolId>(symbol));
+    }
+    return loads;
+  }
+
   // Only meaningful while the shards are not running.
   [[nodiscard]] const OrderBook& book(SymbolId symbol) const noexcept {
     assert(symbol < routes_.size());
@@ -229,6 +274,7 @@ class ShardedEngine {
   };
 
   std::vector<Route> routes_;                           // indexed by the group's SymbolId
+  std::vector<std::uint64_t> shard_loads_;              // expected load assigned to each shard
   std::vector<std::vector<SymbolId>> global_of_;        // [shard][shard's SymbolId] -> group's
   std::vector<std::unique_ptr<MatchingEngine>> shards_;
 };

@@ -1,4 +1,5 @@
 // Several engine threads, each with its own share of the symbols.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -356,8 +357,9 @@ TEST(ShardedThreads, EachShardCanBeFedByItsOwnThread) {
 // private single-book engine, which gives the events that symbol must produce.
 // Then all the commands are interleaved through three shard threads with
 // 4-slot rings, so that every shard is constantly blocked on a full ring.
-// For each symbol, the events that come back must match exactly.
-TEST(ShardedThreads, EverySymbolBehavesAsIfItHadAnEngineToItself) {
+// For each symbol, the events that come back must match exactly, however the
+// symbols were assigned to shards.
+void expect_every_symbol_to_behave_as_if_alone(const std::vector<std::uint64_t>& loads) {
   const std::vector<lob::BookConfig> books{
       {.symbol = "AAA", .min_price = 100, .num_levels = 60, .max_orders = 128},
       {.symbol = "BBB", .min_price = 100, .num_levels = 60, .max_orders = 16},
@@ -414,6 +416,7 @@ TEST(ShardedThreads, EverySymbolBehavesAsIfItHadAnEngineToItself) {
   // 2. The same commands, interleaved, through three shard threads.
   ShardedEngine engine({.books = books,
                         .shards = 3,
+                        .loads = loads,
                         .command_capacity = 4,
                         .event_capacity = 4,
                         .idle = IdleStrategy::Yield});
@@ -467,6 +470,110 @@ TEST(ShardedThreads, EverySymbolBehavesAsIfItHadAnEngineToItself) {
   }
   EXPECT_EQ(engine.events_dropped(), 0u);
   EXPECT_EQ(engine.commands_processed(), script.size());
+}
+
+TEST(ShardedThreads, EverySymbolBehavesAsIfItHadAnEngineToItself) {
+  expect_every_symbol_to_behave_as_if_alone({});
+}
+
+// The same check with the symbols assigned by load, which puts them on
+// different shards from the run above.
+TEST(ShardedThreads, EverySymbolBehavesAsIfAloneWhenAssignedByLoad) {
+  expect_every_symbol_to_behave_as_if_alone({900, 10, 10, 800, 10, 700, 10});
+}
+
+// --- Assigning symbols to shards by load -------------------------------------------
+
+// Symbols 0 and 2 are the busy ones. Dealt in turn they would share shard 0.
+TEST(ShardedByLoad, BusySymbolsArePutOnDifferentShards) {
+  ShardedEngine in_turn({.books = five_books(), .shards = 2});
+  EXPECT_EQ(in_turn.shard_of(0), in_turn.shard_of(2));
+  EXPECT_EQ(in_turn.shard_load(0), 3u);  // with no loads given, a shard's load is its symbol count
+  EXPECT_EQ(in_turn.shard_load(1), 2u);
+
+  ShardedEngine by_load({.books = five_books(), .shards = 2, .loads = {500, 10, 400, 10, 10}});
+  EXPECT_NE(by_load.shard_of(0), by_load.shard_of(2));
+  EXPECT_EQ(by_load.shard_load(by_load.shard_of(0)), 500u);
+  EXPECT_EQ(by_load.shard_load(by_load.shard_of(2)), 430u);
+}
+
+// Assignment changes where a book lives, never what a symbol ID means.
+TEST(ShardedByLoad, SymbolIdsAndRoutingAreUnaffected) {
+  ShardedEngine engine({.books = five_books(), .shards = 3, .loads = {1, 900, 1, 800, 700}});
+  EXPECT_EQ(engine.symbol_id("AAA"), SymbolId{0});
+  EXPECT_EQ(engine.symbol_id("EEE"), SymbolId{4});
+
+  for (SymbolId symbol = 0; symbol < 5; ++symbol) {
+    ASSERT_EQ(engine.submit(symbol, symbol, Side::Sell, 150, Quantity{10} + symbol),
+              SendStatus::Sent);
+  }
+  engine.process_pending();
+  std::vector<SymbolId> answered;
+  engine.poll([&](const Event& event) {
+    EXPECT_EQ(event.type, EventType::Accepted);
+    EXPECT_EQ(event.client_tag, event.symbol);
+    answered.push_back(event.symbol);
+  });
+
+  EXPECT_EQ(answered.size(), 5u);
+  for (SymbolId symbol = 0; symbol < 5; ++symbol) {
+    EXPECT_EQ(engine.book(symbol).symbol(), five_books()[symbol].symbol);
+    EXPECT_EQ(engine.book(symbol).quantity_at(Side::Sell, 150), 10u + symbol);
+  }
+}
+
+TEST(ShardedByLoad, CountsTheCommandsEachSymbolReceives) {
+  ShardedEngine engine({.books = five_books(), .shards = 2});
+  for (int i = 0; i < 7; ++i) {
+    ASSERT_EQ(engine.submit(0, 3, Side::Buy, 150, 1), SendStatus::Sent);
+  }
+  ASSERT_EQ(engine.submit(0, 1, Side::Buy, 150, 1), SendStatus::Sent);
+  ASSERT_EQ(engine.submit(0, 1, Side::Buy, 99, 1), SendStatus::Sent);   // rejected, still work
+  ASSERT_EQ(engine.cancel(0, 1, 12'345), SendStatus::Sent);            // refused, still work
+  EXPECT_EQ(engine.submit(0, 9, Side::Buy, 150, 1), SendStatus::UnknownSymbol);  // never queued
+  engine.process_pending();
+
+  EXPECT_EQ(engine.commands_handled(3), 7u);
+  EXPECT_EQ(engine.commands_handled(1), 3u);
+  EXPECT_EQ(engine.commands_handled(0), 0u);
+  EXPECT_EQ(engine.measured_loads(), (std::vector<std::uint64_t>{0, 3, 0, 7, 0}));
+}
+
+// The intended use: run, measure what each symbol really received, and use
+// that to lay out the next engine.
+TEST(ShardedByLoad, MeasuredLoadsFromOneRunBalanceTheNext) {
+  std::vector<lob::BookConfig> books;
+  for (const char* name : {"A", "B", "C", "D", "E", "F", "G", "H"}) {
+    books.push_back({.symbol = name, .min_price = 100, .num_levels = 100, .max_orders = 512});
+  }
+  // Symbols 0, 2, 4 and 6 are busy. Dealt in turn over two shards, all four
+  // land on shard 0.
+  const std::vector<int> orders_for{400, 5, 300, 5, 200, 5, 100, 5};
+
+  ShardedEngine first({.books = books, .shards = 2});
+  for (SymbolId symbol = 0; symbol < books.size(); ++symbol) {
+    for (int i = 0; i < orders_for[symbol]; ++i) {
+      ASSERT_EQ(first.submit(0, symbol, Side::Buy, 150, 1), SendStatus::Sent);
+    }
+  }
+  first.process_pending();
+  first.poll([](const Event&) {});
+  const std::vector<std::uint64_t> measured = first.measured_loads();
+  ASSERT_EQ(measured, (std::vector<std::uint64_t>{400, 5, 300, 5, 200, 5, 100, 5}));
+
+  // What each shard of the first engine actually handled.
+  std::uint64_t first_shard_0 = 0;
+  std::uint64_t first_shard_1 = 0;
+  for (SymbolId symbol = 0; symbol < books.size(); ++symbol) {
+    (first.shard_of(symbol) == 0 ? first_shard_0 : first_shard_1) += measured[symbol];
+  }
+  EXPECT_EQ(first_shard_0, 1'000u);
+  EXPECT_EQ(first_shard_1, 20u);
+
+  ShardedEngine second({.books = books, .shards = 2, .loads = measured});
+  EXPECT_EQ(second.shard_load(0) + second.shard_load(1), 1'020u);
+  EXPECT_EQ(std::max(second.shard_load(0), second.shard_load(1)), 510u);
+  EXPECT_EQ(std::min(second.shard_load(0), second.shard_load(1)), 510u);
 }
 
 }  // namespace
