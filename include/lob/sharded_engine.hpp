@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
@@ -29,8 +30,8 @@ struct ShardedConfig {
 // What became of a command handed to a ShardedEngine.
 enum class SendStatus : std::uint8_t {
   Sent,           // queued for its shard
-  RingFull,       // the shard's command ring is full; try again
-  UnknownSymbol,  // no such symbol; retrying will not help
+  RingFull,       // a command ring is full; try again
+  UnknownSymbol,  // no such symbol (or, for a move, no such shard); retrying will not help
 };
 
 // Several MatchingEngines side by side, to use more than one core:
@@ -39,36 +40,44 @@ enum class SendStatus : std::uint8_t {
 //   gateway thread(s) +--Command--> [ shard 1 thread: its books ] --Event--+ publisher thread(s)
 //                     +--Command--> [ shard 2 thread: its books ] --Event--+
 //
-// Each symbol lives on exactly one shard, and each shard is a complete
-// MatchingEngine with its own thread and its own pair of rings. Shards share
-// nothing, so there is still no lock anywhere and no cache line that two
-// engine threads both write.
+// Each symbol is run by exactly one shard at a time, and each shard is a
+// complete MatchingEngine with its own thread and its own pair of rings.
+// Shards share nothing on the hot path, so there is still no lock anywhere
+// and no cache line that two engine threads both write.
 //
-// Which shard a symbol gets is decided once, in the constructor. By default
+// The group owns every book. A shard only holds pointers to the books it is
+// running, which is what lets a symbol change shards.
+//
+// Which shard a symbol starts on is decided in the constructor. By default
 // the symbols are dealt in turn: symbol 0 to shard 0, symbol 1 to shard 1, and
 // so on round the shards. If ShardedConfig::loads says how busy each symbol is
 // expected to be, the busy ones are spread out so that every shard carries a
 // similar total; see assign_shards(). measured_loads() reports what each
 // symbol actually received, ready to be used as the loads for the next run.
-// A symbol does not move between shards while the engine exists.
 //
-// Callers use one set of symbol IDs for the whole group; a small table turns
-// an ID into its shard and its position there, so routing is still one array
-// lookup.
+// move_symbol() moves a symbol to another shard while the engine runs.
+//
+// Callers use one set of symbol IDs for the whole group, wherever a symbol is
+// running; a table of one entry per symbol says which shard that is.
 //
 // Threads. Every ring still has exactly one thread on each end, so:
 //
 //   submit(), cancel()   one thread per shard. One thread may feed every
 //                        shard, or each shard may have a feeder of its own.
 //   poll()               one thread per shard, on the same terms.
+//   move_symbol()        the thread that feeds both shards involved
 //   start(), stop()      one controlling thread
 //
-// Order. Events for one symbol arrive in the order they happened. Events for
-// symbols on different shards have no order relative to each other.
+// Order. Events for one symbol arrive in the order they happened, including
+// across a move. Events for symbols on different shards have no order
+// relative to each other.
 class ShardedEngine {
  public:
-  explicit ShardedEngine(const ShardedConfig& config) {
-    assert(!config.books.empty());
+  explicit ShardedEngine(const ShardedConfig& config)
+      : directory_(config.books.size()),
+        shard_of_(config.books.size()),
+        moves_(config.books.size()) {
+    assert(!config.books.empty() && config.books.size() <= MatchingEngine::kMaxSymbols);
     const std::size_t shard_count =
         std::clamp<std::size_t>(config.shards, 1, config.books.size());
     assert(config.pin_to_cpus.empty() || config.pin_to_cpus.size() >= shard_count);
@@ -76,37 +85,41 @@ class ShardedEngine {
     // With no loads given, every symbol counts the same, which deals them out
     // in turn.
     assert(config.loads.empty() || config.loads.size() == config.books.size());
-    const std::vector<std::uint64_t> loads =
-        config.loads.size() == config.books.size()
-            ? config.loads
-            : std::vector<std::uint64_t>(config.books.size(), 1);
-    const std::vector<std::uint16_t> shard_for = assign_shards(loads, shard_count);
+    loads_ = config.loads.size() == config.books.size()
+                 ? config.loads
+                 : std::vector<std::uint64_t>(config.books.size(), 1);
+    const std::vector<std::uint16_t> shard_for = assign_shards(loads_, shard_count);
 
-    // Give each shard its books, remembering the mapping in both directions.
-    std::vector<std::vector<BookConfig>> books_of(shard_count);
-    global_of_.resize(shard_count);
-    shard_loads_.assign(shard_count, 0);
-    routes_.reserve(config.books.size());
+    // The group owns the books; the directory tells the shards where they are.
+    books_.reserve(config.books.size());
+    std::vector<std::vector<SymbolId>> running(shard_count);
     for (std::size_t symbol = 0; symbol < config.books.size(); ++symbol) {
-      const std::size_t shard = shard_for[symbol];
-      routes_.push_back({static_cast<std::uint16_t>(shard),
-                         static_cast<SymbolId>(books_of[shard].size())});
-      books_of[shard].push_back(config.books[symbol]);
-      global_of_[shard].push_back(static_cast<SymbolId>(symbol));
-      shard_loads_[shard] += loads[symbol];
+      books_.push_back(std::make_unique<OrderBook>(config.books[symbol]));
+      directory_.books[symbol] = books_.back().get();
+      shard_of_[symbol].store(shard_for[symbol], std::memory_order_relaxed);
+      running[shard_for[symbol]].push_back(static_cast<SymbolId>(symbol));
     }
 
     shards_.reserve(shard_count);
     for (std::size_t shard = 0; shard < shard_count; ++shard) {
-      shards_.push_back(std::make_unique<MatchingEngine>(EngineConfig{
-          .books = std::move(books_of[shard]),
+      const EngineConfig shard_config{
+          .books = {},
           .command_capacity = config.command_capacity,
           .event_capacity = config.event_capacity,
           .idle = config.idle,
           .pin_to_cpu = config.pin_to_cpus.empty() ? kNoPinning : config.pin_to_cpus[shard],
-      }));
+      };
+      shards_.push_back(
+          std::make_unique<MatchingEngine>(shard_config, directory_, running[shard]));
     }
   }
+
+  // Stops the shards together. Left to the shards' own destructors, one could
+  // wait on another that had not yet been told to stop.
+  ~ShardedEngine() { stop(); }
+
+  ShardedEngine(const ShardedEngine&) = delete;
+  ShardedEngine& operator=(const ShardedEngine&) = delete;
 
   // --- Controlling thread ----------------------------------------------------
 
@@ -117,11 +130,16 @@ class ShardedEngine {
     }
   }
 
-  // Each shard handles everything already queued for it, then its thread is
-  // joined. Safe to call when the shards are not running.
+  // Each shard handles everything already queued for it, including any move
+  // in progress, then its thread is joined. Safe to call when the shards are
+  // not running.
   void stop() {
+    // All are asked first: a shard finishing a move may be waiting on another.
     for (const auto& shard : shards_) {
-      shard->stop();
+      shard->request_stop();
+    }
+    for (const auto& shard : shards_) {
+      shard->join();
     }
   }
 
@@ -133,27 +151,32 @@ class ShardedEngine {
   // --- Layout: any thread ----------------------------------------------------
 
   [[nodiscard]] std::size_t shard_count() const noexcept { return shards_.size(); }
-  [[nodiscard]] std::size_t symbol_count() const noexcept { return routes_.size(); }
+  [[nodiscard]] std::size_t symbol_count() const noexcept { return books_.size(); }
 
-  // The shard a symbol lives on. The symbol must exist.
+  // The shard a symbol's commands currently go to. The symbol must exist.
   [[nodiscard]] std::size_t shard_of(SymbolId symbol) const noexcept {
-    assert(symbol < routes_.size());
-    return routes_[symbol].shard;
+    assert(symbol < shard_of_.size());
+    return shard_of_[symbol].load(std::memory_order_acquire);
   }
 
-  // The total expected load that was assigned to a shard: the sum of
-  // ShardedConfig::loads over its symbols, or simply how many symbols it has
-  // if no loads were given.
+  // The total expected load of the symbols currently assigned to a shard: the
+  // sum of ShardedConfig::loads over them, or simply how many there are if no
+  // loads were given.
   [[nodiscard]] std::uint64_t shard_load(std::size_t shard) const noexcept {
-    return shard_loads_[shard];
+    std::uint64_t total = 0;
+    for (std::size_t symbol = 0; symbol < shard_of_.size(); ++symbol) {
+      if (shard_of_[symbol].load(std::memory_order_acquire) == shard) {
+        total += loads_[symbol];
+      }
+    }
+    return total;
   }
 
   // The ID of the symbol with this name, if there is one. Do it once at
   // start-up, not per order.
   [[nodiscard]] std::optional<SymbolId> symbol_id(std::string_view name) const noexcept {
-    for (std::size_t symbol = 0; symbol < routes_.size(); ++symbol) {
-      const Route route = routes_[symbol];
-      if (shards_[route.shard]->book(route.local).symbol() == name) {
+    for (std::size_t symbol = 0; symbol < books_.size(); ++symbol) {
+      if (books_[symbol]->symbol() == name) {
         return static_cast<SymbolId>(symbol);
       }
     }
@@ -165,56 +188,125 @@ class ShardedEngine {
   [[nodiscard]] SendStatus submit(std::uint64_t client_tag, SymbolId symbol, Side side,
                                   Price price, Quantity quantity,
                                   OrderType order_type = OrderType::Limit) noexcept {
-    if (symbol >= routes_.size()) [[unlikely]] {
+    if (symbol >= shard_of_.size()) [[unlikely]] {
       return SendStatus::UnknownSymbol;
     }
-    const Route route = routes_[symbol];
-    return shards_[route.shard]->submit(client_tag, route.local, side, price, quantity,
-                                        order_type)
+    MatchingEngine& shard = *shards_[shard_of_[symbol].load(std::memory_order_relaxed)];
+    return shard.submit(client_tag, symbol, side, price, quantity, order_type)
                ? SendStatus::Sent
                : SendStatus::RingFull;
   }
 
   [[nodiscard]] SendStatus cancel(std::uint64_t client_tag, SymbolId symbol,
                                   OrderId order_id) noexcept {
-    if (symbol >= routes_.size()) [[unlikely]] {
+    if (symbol >= shard_of_.size()) [[unlikely]] {
       return SendStatus::UnknownSymbol;
     }
-    const Route route = routes_[symbol];
-    return shards_[route.shard]->cancel(client_tag, route.local, order_id)
-               ? SendStatus::Sent
-               : SendStatus::RingFull;
+    MatchingEngine& shard = *shards_[shard_of_[symbol].load(std::memory_order_relaxed)];
+    return shard.cancel(client_tag, symbol, order_id) ? SendStatus::Sent : SendStatus::RingFull;
+  }
+
+  // Moves a symbol to another shard while the engine is running. The book, its
+  // resting orders and their IDs are untouched; only the thread running it
+  // changes.
+  //
+  // How it works. A "let go" command goes into the old shard's queue and a
+  // "take up" command into the new shard's, and from then on the symbol's
+  // commands go to the new shard. Both travel in the same queues as orders, so
+  // every order sent before the move is handled by the old shard, and every
+  // order sent after it by the new one. The old shard's last word on the
+  // symbol is an internal marker in its event stream. The new shard does not
+  // start on the symbol until that marker has been read by poll(), so the
+  // symbol's events stay in order.
+  //
+  // What it costs. The move is finished only when the old shard has worked
+  // through its queue and poll() has read its events. Until then the new shard
+  // is paused at the "take up" command, for all of its symbols. So keep
+  // polling, and expect a brief pause on the destination. move_in_progress()
+  // says when it is over.
+  //
+  // Who may call it. Only the thread that feeds both the old shard and the new
+  // one. If the two shards have different feeder threads, stop both from
+  // submitting for the length of the call.
+  //
+  // Returns Sent if the move was started (or the symbol is already there),
+  // RingFull if either shard's command ring is full, in which case nothing has
+  // changed and the call can be repeated, and UnknownSymbol if there is no
+  // such symbol or shard.
+  [[nodiscard]] SendStatus move_symbol(SymbolId symbol, std::size_t to_shard) noexcept {
+    if (symbol >= shard_of_.size() || to_shard >= shards_.size()) [[unlikely]] {
+      return SendStatus::UnknownSymbol;
+    }
+    const std::size_t from_shard = shard_of_[symbol].load(std::memory_order_relaxed);
+    if (from_shard == to_shard) {
+      return SendStatus::Sent;
+    }
+    MatchingEngine& from = *shards_[from_shard];
+    MatchingEngine& to = *shards_[to_shard];
+    // This thread is the only one adding to either ring, so if both have room
+    // now, both pushes below are certain to succeed.
+    if (from.command_ring_full() || to.command_ring_full()) {
+      return SendStatus::RingFull;
+    }
+
+    const std::uint32_t move_number = moves_[symbol].load(std::memory_order_relaxed) + 1;
+    moves_[symbol].store(move_number, std::memory_order_release);
+    const bool let_go_queued = from.detach(symbol, move_number);
+    shard_of_[symbol].store(static_cast<std::uint16_t>(to_shard), std::memory_order_release);
+    const bool take_up_queued = to.attach(symbol, move_number);
+    assert(let_go_queued && take_up_queued);
+    static_cast<void>(let_go_queued);
+    static_cast<void>(take_up_queued);
+    return SendStatus::Sent;
+  }
+
+  // Whether the symbol's latest move is still under way: it was started, and
+  // its new shard has not taken it up yet. Any thread.
+  [[nodiscard]] bool move_in_progress(SymbolId symbol) const noexcept {
+    assert(symbol < moves_.size());
+    return directory_.gates[symbol].attached.load(std::memory_order_acquire) !=
+           moves_[symbol].load(std::memory_order_acquire);
   }
 
   // --- Publisher threads -----------------------------------------------------
 
-  // Passes every event one shard has published so far to `visit`, in order.
-  // Events carry the group's symbol IDs, not the shard's own.
+  // Passes every event one shard has published so far to `visit`, in order,
+  // and returns how many. Reading is also what lets a move finish.
   template <std::invocable<const Event&> Visitor>
   std::size_t poll(std::size_t shard, Visitor&& visit) noexcept {
-    const std::vector<SymbolId>& global = global_of_[shard];
-    return shards_[shard]->poll([&](const Event& event) {
-      assert(event.symbol < global.size());
-      Event translated = event;
-      translated.symbol = global[event.symbol];
-      visit(translated);
+    std::size_t passed_on = 0;
+    shards_[shard]->poll([&](const Event& event) {
+      if (event.type == EventType::Handoff) [[unlikely]] {
+        // The old shard's last word on a symbol it has let go. Everything it
+        // said before has just been passed on, so the new shard may start.
+        directory_.gates[event.symbol].delivered.store(event.quantity,
+                                                      std::memory_order_release);
+        return;
+      }
+      visit(event);
+      ++passed_on;
     });
+    return passed_on;
   }
 
   // The same for every shard in turn. Use this when one thread reads them all.
   template <std::invocable<const Event&> Visitor>
   std::size_t poll(Visitor&& visit) noexcept {
-    std::size_t polled = 0;
+    std::size_t passed_on = 0;
     for (std::size_t shard = 0; shard < shards_.size(); ++shard) {
-      polled += poll(shard, visit);
+      passed_on += poll(shard, visit);
     }
-    return polled;
+    return passed_on;
   }
 
   // --- Running the shards by hand --------------------------------------------
 
-  // Handles everything queued for every shard, on the calling thread. Only
-  // for when the shards have not been started; see MatchingEngine.
+  // Handles what is queued for every shard, on the calling thread, and returns
+  // how many commands it got through. Only for when the shards have not been
+  // started; see MatchingEngine.
+  //
+  // A move needs both this and poll() to finish, so with a move under way,
+  // call the two alternately until neither has anything left to do.
   std::size_t process_pending() noexcept {
     std::size_t handled = 0;
     for (const auto& shard : shards_) {
@@ -225,6 +317,7 @@ class ShardedEngine {
 
   // --- Any thread ------------------------------------------------------------
 
+  // Submits and cancels handled so far, over all shards.
   [[nodiscard]] std::uint64_t commands_processed() const noexcept {
     std::uint64_t total = 0;
     for (const auto& shard : shards_) {
@@ -241,19 +334,23 @@ class ShardedEngine {
     return total;
   }
 
-  // How many commands have been handled for one symbol so far.
+  // How many commands have been handled for one symbol so far, on whichever
+  // shards it has run.
   [[nodiscard]] std::uint64_t commands_handled(SymbolId symbol) const noexcept {
-    assert(symbol < routes_.size());
-    const Route route = routes_[symbol];
-    return shards_[route.shard]->commands_handled(route.local);
+    assert(symbol < books_.size());
+    std::uint64_t total = 0;
+    for (const auto& shard : shards_) {
+      total += shard->commands_handled(symbol);
+    }
+    return total;
   }
 
   // commands_handled() for every symbol, in symbol order: what each symbol
   // actually received. Pass it as ShardedConfig::loads to balance the next
   // engine on real traffic.
   [[nodiscard]] std::vector<std::uint64_t> measured_loads() const {
-    std::vector<std::uint64_t> loads(routes_.size());
-    for (std::size_t symbol = 0; symbol < routes_.size(); ++symbol) {
+    std::vector<std::uint64_t> loads(books_.size());
+    for (std::size_t symbol = 0; symbol < books_.size(); ++symbol) {
       loads[symbol] = commands_handled(static_cast<SymbolId>(symbol));
     }
     return loads;
@@ -261,22 +358,17 @@ class ShardedEngine {
 
   // Only meaningful while the shards are not running.
   [[nodiscard]] const OrderBook& book(SymbolId symbol) const noexcept {
-    assert(symbol < routes_.size());
-    const Route route = routes_[symbol];
-    return shards_[route.shard]->book(route.local);
+    assert(symbol < books_.size());
+    return *books_[symbol];
   }
 
  private:
-  // Where a symbol lives: which shard, and which of that shard's books.
-  struct Route {
-    std::uint16_t shard;
-    SymbolId local;
-  };
-
-  std::vector<Route> routes_;                           // indexed by the group's SymbolId
-  std::vector<std::uint64_t> shard_loads_;              // expected load assigned to each shard
-  std::vector<std::vector<SymbolId>> global_of_;        // [shard][shard's SymbolId] -> group's
-  std::vector<std::unique_ptr<MatchingEngine>> shards_;
+  std::vector<std::unique_ptr<OrderBook>> books_;         // every book, by SymbolId
+  SymbolDirectory directory_;                             // what the shards share
+  std::vector<std::uint64_t> loads_;                      // expected load, by SymbolId
+  std::vector<std::atomic<std::uint16_t>> shard_of_;      // where each symbol's commands go
+  std::vector<std::atomic<std::uint32_t>> moves_;         // how many times each has been moved
+  std::vector<std::unique_ptr<MatchingEngine>> shards_;   // last: destroyed first
 };
 
 }  // namespace lob

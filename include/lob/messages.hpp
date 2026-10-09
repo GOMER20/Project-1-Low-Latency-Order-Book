@@ -7,7 +7,14 @@
 
 namespace lob {
 
-enum class CommandType : std::uint8_t { Submit, Cancel };
+enum class CommandType : std::uint8_t {
+  Submit,
+  Cancel,
+  // The next two are sent by ShardedEngine to move a symbol from one engine to
+  // another; see MatchingEngine::detach(). `quantity` carries the move's number.
+  Detach,  // stop running this symbol and say so
+  Attach,  // start running this symbol, once it has been let go
+};
 
 // A request sent to the engine thread.
 //
@@ -38,6 +45,10 @@ enum class EventType : std::uint8_t {
   Trade,           // one fill between the command's order and a resting order
   Cancelled,       // a Cancel removed its order
   CancelRejected,  // a Cancel named an order that is not live, or an unknown symbol
+  // Internal. An engine's last word on a symbol it has stopped running, with
+  // the move's number in `quantity`. ShardedEngine reads it and never passes
+  // it on to its caller.
+  Handoff,
 };
 
 // Something the engine thread did in response to a command.

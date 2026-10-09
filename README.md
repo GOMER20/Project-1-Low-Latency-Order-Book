@@ -30,7 +30,7 @@ through lock-free ring buffers, so no other thread can ever block it.
 | `SpscRing` | [include/lob/spsc_ring.hpp](include/lob/spsc_ring.hpp) | A wait-free queue between one producer thread and one consumer thread. Each side's counter has its own cache line, and each side caches the other's counter so it rarely reads it. |
 | `Command`, `Event` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings. |
 | `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | One `OrderBook` per symbol, all on one engine thread between a command ring and an event ring. The thread can be pinned to a CPU. |
-| `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread, rings and share of the symbols, to use more than one core. |
+| `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread and rings, to use more than one core. It owns every book, decides which shard runs each symbol, and can move a symbol to another shard while running. |
 | `assign_shards` | [include/lob/shard_assignment.hpp](include/lob/shard_assignment.hpp) | Decides which shard each symbol gets from how busy each is expected to be, so that the shards carry similar totals. |
 
 Design rules followed throughout:
@@ -197,12 +197,44 @@ quietest and give each to the shard carrying the least so far. The busiest
 shard then never carries more than 4/3 of what the best possible split would
 give it.
 
+A symbol can also be moved to another shard while the engine is running, for
+when one becomes busy in the middle of a session:
+
+```cpp
+if (engine.move_symbol(aapl, 2) == lob::SendStatus::Sent) {
+  // Orders for AAPL already go to shard 2. Keep polling: the move finishes
+  // once the old shard's events have been read.
+}
+while (engine.move_in_progress(aapl)) {
+  engine.poll([&](const lob::Event& event) { /* ... */ });
+}
+```
+
+The book, its resting orders and their IDs are untouched; only the thread
+running it changes. The group owns every book and a shard just holds pointers
+to the ones it is running, so nothing is copied.
+
+How the handover stays correct:
+
+1. A "let go" command goes into the old shard's queue and a "take up" command
+   into the new shard's. They travel in the same queues as orders, so every
+   order sent before the move is handled by the old shard and every order sent
+   after it by the new one.
+2. The old shard's last word on the symbol is an internal marker in its event
+   stream.
+3. The new shard does not start on the symbol until `poll` has read that
+   marker. The symbol's events therefore stay in order, and the two threads
+   never touch the book at the same time.
+
+Call `move_symbol` from the thread that feeds both shards involved.
+
 Two things differ from a single engine:
 
 - **Threads.** Each shard's rings still take one thread on each end. One thread
   may feed every shard, or each shard may have a feeder of its own; the same
   goes for reading events with `poll(shard, ...)`.
-- **Order.** Events for one symbol arrive in the order they happened. Events
+- **Order.** Events for one symbol arrive in the order they happened, even
+  when the symbol is moved between shards. Events
   for symbols on different shards have no order relative to each other.
 
 ## Build
@@ -265,6 +297,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/multi_symbol_test.cpp](tests/multi_symbol_test.cpp) | Routing by symbol, unknown symbols, per-book order IDs and limits, and 9,000 interleaved commands checked against running each symbol alone. |
 | [tests/sharded_engine_test.cpp](tests/sharded_engine_test.cpp) | How symbols are dealt to shards, routing and symbol IDs, one feeder thread per shard, and 12,000 random commands through three shard threads compared, symbol by symbol, with each symbol running alone. |
 | [tests/shard_assignment_test.cpp](tests/shard_assignment_test.cpp) | Equal loads dealt in turn, busy symbols kept apart, no shard left empty, and 400 random cases checked against the best possible split. |
+| [tests/symbol_move_test.cpp](tests/symbol_move_test.cpp) | Moving a symbol between shards: orders and IDs survive, events stay in order, queued and repeated moves, full rings, stopping or destroying the engine mid-move, and 12,000 random commands with hundreds of random moves compared, symbol by symbol, with each symbol running alone. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
 
@@ -295,6 +328,7 @@ To run only the headline numbers:
 | `BM_Engine_RoundTrip` | One command sent to the engine thread and its answer received: both rings plus the book. |
 | `BM_Engine_Throughput/N` | Commands per second through the whole pipeline when the sender does not wait for answers, with the orders spread over N symbols. |
 | `BM_Sharded_Throughput/N` | Total commands per second across N shards, each with its own feeder thread: 2N busy threads in all. |
+| `BM_Sharded_MoveSymbol` | How long one move takes between two otherwise idle shards. |
 
 The deep-book benchmarks shuffle their orders first, so resting orders and free
 slots are scattered through memory rather than laid out in insertion order.
@@ -317,9 +351,10 @@ with other programs running: no core isolation, no pinning.
 | `BM_OrderPool_AllocateDeallocate` vs `BM_Heap_NewDelete` | 1.22 ns vs 181 ns |
 | `BM_IntrusiveLevel_AddCancel` vs `BM_StdList_AddCancel` | 2.33 ns vs 197 ns |
 | `BM_SpscRing_TwoThreads` vs `BM_MutexRing_TwoThreads` | 2.5 ns vs 106 ns per event (about 400 million vs 9 million events per second) |
-| `BM_Engine_RoundTrip` | about 275 ns from sending a command to receiving its answer |
-| `BM_Engine_Throughput/1`, `/8`, `/64` | about 12 million commands per second, the same with 1, 8 or 64 symbols |
-| `BM_Sharded_Throughput/1`, `/2`, `/4` | about 1.6 times the throughput of one shard with two, and about 2.7 times with four. Measured later, with the laptop busy and running hot, so only the ratios are given. Four shards means eight busy threads on its eight cores. |
+| `BM_Engine_RoundTrip` | about 250 ns from sending a command to receiving its answer |
+| `BM_Engine_Throughput/1`, `/8`, `/64` | 12 to 13 million commands per second, the same with 1, 8 or 64 symbols |
+| `BM_Sharded_Throughput/1`, `/2`, `/4` | 9 to 15 million commands per second with one shard; roughly 1.2 to 1.6 times that with two and 1.8 to 2.7 times with four. These readings vary a lot from run to run: four shards means eight busy threads on this laptop's eight cores. |
+| `BM_Sharded_MoveSymbol` | about 450 to 530 ns per move |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
@@ -328,7 +363,10 @@ machine is; run them on the hardware you care about.
 
 - **One symbol per book, one thread per book.** The book has no locks or atomics.
 - **One engine thread runs all of its symbols.** `ShardedEngine` uses more cores by running several engines, each with its own symbols and rings. An engine holds at most 65,535 symbols.
-- **Symbols are assigned to shards once, at start-up.** They are dealt in turn unless you supply expected loads. A symbol never moves between shards while the engine is running, so a symbol that becomes busy mid-session stays where it is.
+- **Nothing rebalances the shards for you.** Symbols are dealt in turn, or by the loads you supply, at start-up. After that a symbol moves only when you call `move_symbol`.
+- **A move pauses its destination.** The new shard waits, for all of its symbols, until the old shard has worked through its queue and `poll` has read its events. Idle shards hand over in about half a microsecond; a backlog on the old shard, or a slow reader, makes it longer.
+- **A move needs the events to be read.** If nothing calls `poll`, a move does not finish until the engine is stopped. If the engine is stopped mid-move, the move still completes, but the symbol's events from either side of it may then be read out of order.
+- **`move_symbol` must be called by the thread that feeds both shards.** If each shard has its own feeder thread, both must pause for the call.
 - **Load-based assignment is good, not optimal.** The busiest shard carries at most 4/3 of the best possible, and a single symbol busier than all the others together still fills a shard on its own.
 - **There is no ordering between shards.** Events for one symbol are in order; events for symbols on different shards are not ordered relative to each other.
 - **Order IDs are unique within a symbol, not across symbols.** A cancel must name both.
@@ -359,7 +397,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 11 — Multiple symbols on one engine
 - [x] Phase 12 — Several engine threads, each with its own share of the symbols
 - [x] Phase 13 — Assigning symbols to shards by expected or measured load
-- [ ] Next — Moving a symbol between shards while the engine is running
+- [x] Phase 14 — Moving a symbol between shards while the engine is running
+- [ ] Next — Rebalancing automatically from measured load
 
 ## Layout
 

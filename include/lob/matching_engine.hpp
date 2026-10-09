@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -34,6 +35,24 @@ struct EngineConfig {
   std::size_t event_capacity = 1 << 16;    // outbound ring; rounded up to a power of two
   IdleStrategy idle = IdleStrategy::Spin;
   int pin_to_cpu = kNoPinning;             // CPU to bind the engine thread to (Linux only)
+};
+
+// The three milestones of moving one symbol from one engine to another. Each
+// holds the number of the latest move to have reached it; the moves of a
+// symbol are numbered 1, 2, 3 and so on.
+struct MigrationGate {
+  std::atomic<std::uint32_t> detached{0};   // the old engine has let go of the book
+  std::atomic<std::uint32_t> delivered{0};  // everything the old engine said has been read
+  std::atomic<std::uint32_t> attached{0};   // the new engine has taken the book up
+};
+
+// Shared by a group of engines that can pass symbols between them: every
+// symbol's book, and its gate. The engines do not own the books.
+struct SymbolDirectory {
+  explicit SymbolDirectory(std::size_t symbols) : books(symbols, nullptr), gates(symbols) {}
+
+  std::vector<OrderBook*> books;     // by SymbolId
+  std::vector<MigrationGate> gates;  // by SymbolId
 };
 
 // One order book per symbol, all running on a single engine thread that is fed
@@ -67,17 +86,38 @@ class MatchingEngine {
  public:
   static constexpr std::size_t kMaxSymbols = std::numeric_limits<SymbolId>::max();
 
-  // All memory for every book and both rings is acquired here.
+  // An engine with books of its own. All memory for every book and both rings
+  // is acquired here.
   explicit MatchingEngine(const EngineConfig& config)
-      : handled_(config.books.size()),
+      : books_(config.books.size(), nullptr),
+        handled_(config.books.size()),
         commands_(config.command_capacity),
         events_(config.event_capacity),
         idle_(config.idle),
         pin_to_cpu_(config.pin_to_cpu) {
     assert(!config.books.empty() && config.books.size() <= kMaxSymbols);
-    books_.reserve(config.books.size());
-    for (const BookConfig& book : config.books) {
-      books_.push_back(std::make_unique<OrderBook>(book));
+    owned_.reserve(config.books.size());
+    for (std::size_t symbol = 0; symbol < config.books.size(); ++symbol) {
+      owned_.push_back(std::make_unique<OrderBook>(config.books[symbol]));
+      books_[symbol] = owned_.back().get();
+    }
+  }
+
+  // One engine of a group that can pass symbols between its members; this is
+  // how ShardedEngine builds its shards. The books belong to the directory's
+  // owner and must outlive the engine. The engine starts out running the
+  // symbols listed in `running`; config.books is ignored.
+  MatchingEngine(const EngineConfig& config, SymbolDirectory& directory,
+                 std::span<const SymbolId> running)
+      : books_(directory.books.size(), nullptr),
+        handled_(directory.books.size()),
+        directory_(&directory),
+        commands_(config.command_capacity),
+        events_(config.event_capacity),
+        idle_(config.idle),
+        pin_to_cpu_(config.pin_to_cpu) {
+    for (const SymbolId symbol : running) {
+      books_[symbol] = directory.books[symbol];
     }
   }
 
@@ -104,11 +144,22 @@ class MatchingEngine {
   // Processes every command that was queued before the call, then joins the
   // engine thread. Safe to call when the engine is not running.
   void stop() {
-    if (!thread_.joinable()) {
-      return;
+    request_stop();
+    join();
+  }
+
+  // The two halves of stop(), for stopping several engines together: ask them
+  // all to stop first, then wait for each.
+  void request_stop() noexcept {
+    if (thread_.joinable()) {
+      stop_requested_.store(true, std::memory_order_release);
     }
-    stop_requested_.store(true, std::memory_order_release);
-    thread_.join();
+  }
+
+  void join() {
+    if (thread_.joinable()) {
+      thread_.join();
+    }
   }
 
   [[nodiscard]] bool running() const noexcept { return thread_.joinable(); }
@@ -122,11 +173,12 @@ class MatchingEngine {
 
   [[nodiscard]] std::size_t symbol_count() const noexcept { return books_.size(); }
 
-  // The ID of the book with this symbol name, if there is one. A linear search
-  // over the names: do it once at start-up, not per order.
+  // The ID of the book with this symbol name, among the books this engine was
+  // built with. A linear search over the names: do it once at start-up, not
+  // per order.
   [[nodiscard]] std::optional<SymbolId> symbol_id(std::string_view name) const noexcept {
-    for (std::size_t index = 0; index < books_.size(); ++index) {
-      if (books_[index]->symbol() == name) {
+    for (std::size_t index = 0; index < owned_.size(); ++index) {
+      if (owned_[index]->symbol() == name) {
         return static_cast<SymbolId>(index);
       }
     }
@@ -134,9 +186,9 @@ class MatchingEngine {
   }
 
   // --- Gateway thread --------------------------------------------------------
-  // Both return false if the command ring is full; the caller decides whether
-  // to retry. A command for a symbol the engine does not have is accepted here
-  // and answered with Rejected or CancelRejected.
+  // All of these return false if the command ring is full; the caller decides
+  // whether to retry. A command for a symbol the engine is not running is
+  // accepted here and answered with Rejected or CancelRejected.
 
   [[nodiscard]] bool submit(std::uint64_t client_tag, SymbolId symbol, Side side, Price price,
                             Quantity quantity,
@@ -162,6 +214,29 @@ class MatchingEngine {
     return commands_.try_push(command);
   }
 
+  // The two halves of moving a symbol to another engine of the same group.
+  // Only for engines built with a SymbolDirectory; ShardedEngine calls these.
+  //
+  // detach: once everything queued ahead of it has been handled, the engine
+  // stops running the symbol and publishes a Handoff event as its last word
+  // on it.
+  [[nodiscard]] bool detach(SymbolId symbol, std::uint32_t move_number) noexcept {
+    return commands_.try_push(migration_command(CommandType::Detach, symbol, move_number));
+  }
+
+  // attach: the engine takes the symbol up, but not before the old engine's
+  // Handoff has been read from its event ring. Until then this command, and
+  // everything queued behind it, waits.
+  [[nodiscard]] bool attach(SymbolId symbol, std::uint32_t move_number) noexcept {
+    return commands_.try_push(migration_command(CommandType::Attach, symbol, move_number));
+  }
+
+  // Whether the command ring is full right now. Only the gateway thread adds
+  // to the ring, so if it sees room, its next push will succeed.
+  [[nodiscard]] bool command_ring_full() const noexcept {
+    return commands_.size() == commands_.capacity();
+  }
+
   // --- Publisher thread ------------------------------------------------------
 
   // Passes every event published so far to `visit`, in order. Returns how many.
@@ -172,16 +247,29 @@ class MatchingEngine {
 
   // --- Engine thread ---------------------------------------------------------
 
-  // Handles every command currently queued and returns how many there were.
+  // Handles the commands currently queued and returns how many it got through.
   // The engine thread calls this in a loop. If the engine has not been
   // started, the caller may call it instead to run the engine by hand on its
   // own thread; nothing can drain events while it runs, so events that do not
   // fit in the event ring are then discarded and counted.
+  //
+  // It stops early at an Attach whose symbol has not been handed over yet,
+  // leaving that command and everything behind it queued for the next call.
   std::size_t process_pending() noexcept {
-    const std::size_t count =
-        commands_.drain([this](const Command& command) { handle(command); });
-    if (count != 0) {
-      commands_processed_.store(commands_processed_.load(std::memory_order_relaxed) + count,
+    // Counted in a local, not a member: a member would be written to memory
+    // once per command, which measurably slows the engine thread.
+    std::uint64_t orders = 0;
+    const std::size_t count = commands_.drain_while([&](const Command& command) {
+      if (!handle(command)) {
+        return false;
+      }
+      if (command.type == CommandType::Submit || command.type == CommandType::Cancel) {
+        ++orders;
+      }
+      return true;
+    });
+    if (orders != 0) {
+      commands_processed_.store(commands_processed_.load(std::memory_order_relaxed) + orders,
                                 std::memory_order_release);
     }
     return count;
@@ -189,6 +277,7 @@ class MatchingEngine {
 
   // --- Any thread ------------------------------------------------------------
 
+  // Submits and cancels handled so far.
   [[nodiscard]] std::uint64_t commands_processed() const noexcept {
     return commands_processed_.load(std::memory_order_acquire);
   }
@@ -204,13 +293,31 @@ class MatchingEngine {
     return handled_[symbol].load(std::memory_order_relaxed);
   }
 
-  // Only meaningful while the engine thread is not running.
+  // Only meaningful while the engine thread is not running, and only for a
+  // symbol this engine is running.
   [[nodiscard]] const OrderBook& book(SymbolId symbol) const noexcept {
-    assert(symbol < books_.size());
+    assert(symbol < books_.size() && books_[symbol] != nullptr);
     return *books_[symbol];
   }
 
  private:
+  static Command migration_command(CommandType type, SymbolId symbol,
+                                   std::uint32_t move_number) noexcept {
+    Command command{};
+    command.quantity = move_number;
+    command.symbol = symbol;
+    command.type = type;
+    return command;
+  }
+
+  void idle() const noexcept {
+    if (idle_ == IdleStrategy::Yield) {
+      std::this_thread::yield();
+    } else {
+      cpu_relax();
+    }
+  }
+
   void run() noexcept {
     if (pin_to_cpu_ != kNoPinning) {
       pinned_.store(pin_current_thread_to_cpu(pin_to_cpu_), std::memory_order_release);
@@ -219,21 +326,43 @@ class MatchingEngine {
 
     while (!stop_requested_.load(std::memory_order_acquire)) {
       if (process_pending() == 0) {
-        if (idle_ == IdleStrategy::Yield) {
-          std::this_thread::yield();
-        } else {
-          cpu_relax();
-        }
+        idle();
       }
     }
-    process_pending();  // honour everything queued before stop() was called
+
+    // Shutting down: honour everything queued before stop() was called. If
+    // that includes taking up a symbol another engine has not let go of yet,
+    // wait for it: that engine is shutting down too and will get there.
+    draining_ = true;
+    do {
+      process_pending();
+      if (waiting_to_attach_) {
+        idle();
+      }
+    } while (waiting_to_attach_);
+    draining_ = false;
   }
 
-  void handle(const Command& command) noexcept {
-    // Routing is one bounds check and one array index. A symbol the engine
-    // does not have gets no book, and the command is answered as refused.
-    OrderBook* const book =
-        command.symbol < books_.size() ? books_[command.symbol].get() : nullptr;
+  // Returns false if the command cannot be handled yet and must stay queued.
+  bool handle(const Command& command) noexcept {
+    switch (command.type) {
+      case CommandType::Submit:
+      case CommandType::Cancel:
+        handle_order(command);
+        return true;
+      case CommandType::Detach:
+        handle_detach(command);
+        return true;
+      case CommandType::Attach:
+        return handle_attach(command);
+    }
+    return true;
+  }
+
+  void handle_order(const Command& command) noexcept {
+    // Routing is one bounds check and one array index. A symbol this engine
+    // is not running has no book here, and the command is answered as refused.
+    OrderBook* const book = command.symbol < books_.size() ? books_[command.symbol] : nullptr;
 
     if (book != nullptr) [[likely]] {
       // Only this thread writes the counter, so a plain add is enough.
@@ -276,23 +405,82 @@ class MatchingEngine {
     publish(event);
   }
 
-  void publish(const Event& event) noexcept {
-    while (!events_.try_push(event)) {
-      if (stop_requested_.load(std::memory_order_acquire)) {
-        events_dropped_.store(events_dropped_.load(std::memory_order_relaxed) + 1,
-                              std::memory_order_release);
-        return;
-      }
-      cpu_relax();
+  // Stop running a symbol. Everything queued for it ahead of this command has
+  // been handled, because commands are handled in order.
+  void handle_detach(const Command& command) noexcept {
+    assert(directory_ != nullptr && command.symbol < books_.size());
+    books_[command.symbol] = nullptr;
+    directory_->gates[command.symbol].detached.store(command.quantity,
+                                                    std::memory_order_release);
+
+    // The last thing this engine says about the symbol. Whoever reads the
+    // event ring reaches it only after every earlier event for the symbol.
+    Event handoff{};
+    handoff.symbol = command.symbol;
+    handoff.quantity = command.quantity;
+    handoff.type = EventType::Handoff;
+    if (!publish(handoff, /*count_if_discarded=*/false)) {
+      // It could not be published, which only happens when events are being
+      // discarded anyway. Nobody will ever read it, so open the gate here
+      // rather than leave the symbol stranded between engines.
+      directory_->gates[command.symbol].delivered.store(command.quantity,
+                                                       std::memory_order_release);
     }
   }
 
-  std::vector<std::unique_ptr<OrderBook>> books_;    // indexed by SymbolId
+  // Take a symbol up, if it has been handed over.
+  //
+  // Normally that means the old engine's Handoff has been read from its event
+  // ring, so that everything it said about the symbol is delivered before this
+  // engine says anything. During shutdown nobody may be reading, so it is
+  // enough that the old engine has let go.
+  bool handle_attach(const Command& command) noexcept {
+    assert(directory_ != nullptr && command.symbol < books_.size());
+    MigrationGate& gate = directory_->gates[command.symbol];
+    const std::uint32_t move_number = command.quantity;
+    const bool handed_over =
+        gate.delivered.load(std::memory_order_acquire) >= move_number ||
+        (draining_ && gate.detached.load(std::memory_order_acquire) >= move_number);
+    if (!handed_over) {
+      waiting_to_attach_ = true;
+      return false;
+    }
+    books_[command.symbol] = directory_->books[command.symbol];
+    gate.attached.store(move_number, std::memory_order_release);
+    waiting_to_attach_ = false;
+    return true;
+  }
+
+  // Returns false if the event had to be discarded: the ring is full and the
+  // engine is not running, or is shutting down.
+  bool publish(const Event& event, bool count_if_discarded = true) noexcept {
+    while (!events_.try_push(event)) {
+      if (stop_requested_.load(std::memory_order_acquire)) {
+        if (count_if_discarded) {
+          events_dropped_.store(events_dropped_.load(std::memory_order_relaxed) + 1,
+                                std::memory_order_release);
+        }
+        return false;
+      }
+      cpu_relax();
+    }
+    return true;
+  }
+
+  std::vector<std::unique_ptr<OrderBook>> owned_;    // books this engine created, if any
+  std::vector<OrderBook*> books_;                    // the book it runs for each SymbolId, or
+                                                     // nullptr; changed only by the engine thread
   std::vector<std::atomic<std::uint64_t>> handled_;  // commands handled, per symbol
+  SymbolDirectory* directory_ = nullptr;             // set only for a member of a group
   SpscRing<Command> commands_;
   SpscRing<Event> events_;
   IdleStrategy idle_;
   int pin_to_cpu_;
+
+  // Touched only by whichever thread is running the engine, and only when a
+  // symbol is changing hands.
+  bool waiting_to_attach_ = false;  // the queue is stopped at an Attach that is not ready
+  bool draining_ = false;           // the engine is shutting down
 
   // True whenever the engine thread should not be (or is not) running.
   alignas(kCacheLineSize) std::atomic<bool> stop_requested_{true};

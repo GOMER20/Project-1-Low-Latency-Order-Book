@@ -126,11 +126,13 @@ if(LOB_BUILD_TESTS)
     tests/thread_affinity_test.cpp
     tests/multi_symbol_test.cpp
     tests/sharded_engine_test.cpp
-    tests/shard_assignment_test.cpp)
+    tests/shard_assignment_test.cpp
+    tests/symbol_move_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   # Listing the tests runs the binary at build time. The default limit of 5
   # seconds is too tight for a sanitizer build on a busy machine.
-  gtest_discover_tests(lob_tests DISCOVERY_TIMEOUT 120)
+  # The per-test limit turns a hang into a failure instead of a stalled run.
+  gtest_discover_tests(lob_tests DISCOVERY_TIMEOUT 120 PROPERTIES TIMEOUT 300)
 
   # This test replaces global operator new to count allocations. Sanitizer
   # runtimes replace operator new too, and the two cannot share a binary, so
@@ -139,7 +141,7 @@ if(LOB_BUILD_TESTS)
     lob_add_executable(lob_allocation_test
       tests/allocation_test.cpp)
     target_link_libraries(lob_allocation_test PRIVATE GTest::gtest_main)
-    gtest_discover_tests(lob_allocation_test DISCOVERY_TIMEOUT 120)
+    gtest_discover_tests(lob_allocation_test DISCOVERY_TIMEOUT 120 PROPERTIES TIMEOUT 300)
   endif()
 endif()
 
