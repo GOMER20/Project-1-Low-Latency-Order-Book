@@ -19,6 +19,9 @@ using lob::Side;
 constexpr lob::BookConfig kBook{
     .symbol = "TEST", .min_price = 100, .num_levels = 100, .max_orders = 64};
 
+// These tests use a single book, which is symbol 0.
+constexpr lob::SymbolId kSymbol = 0;
+
 // A CPU this process is certainly allowed to run on: the one it is on now.
 int a_usable_cpu() {
 #if defined(__linux__)
@@ -30,7 +33,7 @@ int a_usable_cpu() {
 
 // Sends one order and waits for its answer, to show the engine is alive.
 bool engine_answers(MatchingEngine& engine) {
-  if (!engine.submit(1, Side::Buy, 150, 10)) {
+  if (!engine.submit(1, kSymbol, Side::Buy, 150, 10)) {
     return false;
   }
   std::size_t answers = 0;
@@ -69,7 +72,7 @@ TEST(ThreadAffinity, PinnedThreadStaysOnItsCpu) {
 #endif
 
 TEST(EnginePinning, UnpinnedByDefault) {
-  MatchingEngine engine({.book = kBook, .idle = lob::IdleStrategy::Yield});
+  MatchingEngine engine({.books = {kBook}, .idle = lob::IdleStrategy::Yield});
   engine.start();
   EXPECT_FALSE(engine.pinned());
   EXPECT_TRUE(engine_answers(engine));
@@ -79,7 +82,7 @@ TEST(EnginePinning, UnpinnedByDefault) {
 // On Linux the engine must end up pinned; elsewhere pinning is unavailable and
 // the engine must say so. It has to work in both cases.
 TEST(EnginePinning, ReportsWhetherThePinTookEffect) {
-  MatchingEngine engine({.book = kBook,
+  MatchingEngine engine({.books = {kBook},
                          .idle = lob::IdleStrategy::Yield,
                          .pin_to_cpu = a_usable_cpu()});
   engine.start();
@@ -90,7 +93,7 @@ TEST(EnginePinning, ReportsWhetherThePinTookEffect) {
 
 TEST(EnginePinning, RunsUnpinnedIfTheCpuDoesNotExist) {
   MatchingEngine engine(
-      {.book = kBook, .idle = lob::IdleStrategy::Yield, .pin_to_cpu = 1 << 20});
+      {.books = {kBook}, .idle = lob::IdleStrategy::Yield, .pin_to_cpu = 1 << 20});
   engine.start();
   EXPECT_FALSE(engine.pinned());
   EXPECT_TRUE(engine_answers(engine));
