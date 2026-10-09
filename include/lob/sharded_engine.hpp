@@ -57,6 +57,7 @@ struct ShardedConfig {
   IdleStrategy idle = IdleStrategy::Spin;
   std::vector<int> pin_to_cpus = {};       // optional: the CPU for each shard, in order (Linux only)
   std::uint32_t time_one_in = 64;          // see EngineConfig::time_one_in; 0 turns timing off
+  std::size_t market_data_capacity = 0;    // per shard; 0 turns the market data feed off
 };
 
 // What became of a command handed to a ShardedEngine.
@@ -100,6 +101,7 @@ enum class SendStatus : std::uint8_t {
 //   submit(), cancel()   one thread per shard. One thread may feed every
 //                        shard, or each shard may have a feeder of its own.
 //   poll()               one thread per shard, on the same terms.
+//   poll_market_data()   one thread per shard, on the same terms.
 //   move_symbol()        the thread that feeds both shards involved
 //   rebalance()          the thread that feeds every shard
 //   start(), stop()      one controlling thread
@@ -107,6 +109,14 @@ enum class SendStatus : std::uint8_t {
 // Order. Events for one symbol arrive in the order they happened, including
 // across a move. Events for symbols on different shards have no order
 // relative to each other.
+//
+// Market data. Each shard has its own market data ring. A symbol's messages
+// are numbered in one sequence wherever it is running, and when a symbol
+// arrives on a new shard that shard starts with a fresh picture of it (a
+// Clear, its levels, its best prices). A reader that applies a symbol's
+// messages in sequence order and ignores any that are older than the last it
+// applied therefore stays correct across a move, whichever ring it reads
+// first. BookMirror does exactly that.
 class ShardedEngine {
  public:
   explicit ShardedEngine(const ShardedConfig& config)
@@ -154,6 +164,7 @@ class ShardedEngine {
           .idle = config.idle,
           .pin_to_cpu = config.pin_to_cpus.empty() ? kNoPinning : config.pin_to_cpus[shard],
           .time_one_in = config.time_one_in,
+          .market_data_capacity = config.market_data_capacity,
       };
       shards_.push_back(
           std::make_unique<MatchingEngine>(shard_config, directory_, running[shard]));
@@ -256,6 +267,17 @@ class ShardedEngine {
     }
     count_towards_rebalance();
     return SendStatus::Sent;
+  }
+
+  // Asks for a fresh picture of one symbol on the market data feed; see
+  // MatchingEngine::request_snapshot(). Call it from the thread that feeds the
+  // symbol's shard.
+  [[nodiscard]] SendStatus request_snapshot(SymbolId symbol) noexcept {
+    if (symbol >= shard_of_.size()) [[unlikely]] {
+      return SendStatus::UnknownSymbol;
+    }
+    MatchingEngine& shard = *shards_[shard_of_[symbol].load(std::memory_order_relaxed)];
+    return shard.request_snapshot(symbol) ? SendStatus::Sent : SendStatus::RingFull;
   }
 
   // Moves a symbol to another shard while the engine is running. The book, its
@@ -430,6 +452,26 @@ class ShardedEngine {
     return passed_on;
   }
 
+  // --- Market data threads ---------------------------------------------------
+
+  // Passes every market data message one shard has published so far to
+  // `visit`, in order, and returns how many. Market data is never waited for:
+  // see MatchingEngine::poll_market_data().
+  template <std::invocable<const MarketData&> Visitor>
+  std::size_t poll_market_data(std::size_t shard, Visitor&& visit) noexcept {
+    return shards_[shard]->poll_market_data(std::forward<Visitor>(visit));
+  }
+
+  // The same for every shard in turn. Use this when one thread reads them all.
+  template <std::invocable<const MarketData&> Visitor>
+  std::size_t poll_market_data(Visitor&& visit) noexcept {
+    std::size_t polled = 0;
+    for (const auto& shard : shards_) {
+      polled += shard->poll_market_data(visit);
+    }
+    return polled;
+  }
+
   // --- Running the shards by hand --------------------------------------------
 
   // Handles what is queued for every shard, on the calling thread, and returns
@@ -461,6 +503,15 @@ class ShardedEngine {
     std::uint64_t total = 0;
     for (const auto& shard : shards_) {
       total += shard->events_dropped();
+    }
+    return total;
+  }
+
+  // Market data messages dropped because a shard's ring was full.
+  [[nodiscard]] std::uint64_t market_data_dropped() const noexcept {
+    std::uint64_t total = 0;
+    for (const auto& shard : shards_) {
+      total += shard->market_data_dropped();
     }
     return total;
   }

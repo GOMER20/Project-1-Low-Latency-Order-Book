@@ -28,7 +28,8 @@ through lock-free ring buffers, so no other thread can ever block it.
 | `OrderBook` | [include/lob/order_book.hpp](include/lob/order_book.hpp) | Flat array of levels per side, indexed by `price - min_price`. Implements `submit` for limit, market, IOC and FOK orders, plus `add`, `cancel` and `execute`. |
 | `Trade` | [include/lob/trade.hpp](include/lob/trade.hpp) | The 40-byte event emitted for every fill. |
 | `SpscRing` | [include/lob/spsc_ring.hpp](include/lob/spsc_ring.hpp) | A wait-free queue between one producer thread and one consumer thread. Each side's counter has its own cache line, and each side caches the other's counter so it rarely reads it. |
-| `Command`, `Event` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings. |
+| `Command`, `Event`, `MarketData` | [include/lob/messages.hpp](include/lob/messages.hpp) | The 32-byte request and 48-byte response that cross the rings, and the 64-byte message of the public market data feed. |
+| `BookMirror` | [include/lob/book_mirror.hpp](include/lob/book_mirror.hpp) | A symbol's prices and depth rebuilt from the market data feed: the reference for how to read it. For the reading side, so it uses ordinary containers. |
 | `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | One `OrderBook` per symbol, all on one engine thread between a command ring and an event ring. The thread can be pinned to a CPU. |
 | `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread and rings, to use more than one core. It owns every book, decides which shard runs each symbol, and can move a symbol to another shard while running. |
 | `assign_shards`, `choose_rebalancing_move` | [include/lob/shard_assignment.hpp](include/lob/shard_assignment.hpp) | The two placement decisions: which shard each symbol starts on, given how busy each is expected to be, and which single symbol to move when the shards have drifted out of balance. |
@@ -132,6 +133,55 @@ string comparison or hashing on the hot path.
 
 `submit` on the engine takes the same optional order type as the book:
 `engine.submit(2, aapl, lob::Side::Buy, 0, 500, lob::OrderType::Market)`.
+
+### The market data feed
+
+Events tell the sender of an order what became of it. The market data feed is
+the public side: what anyone may see of a symbol. It is off unless you give it
+a ring:
+
+```cpp
+lob::MatchingEngine engine({.books = {book_config}, .market_data_capacity = 1 << 16});
+engine.start();
+
+lob::BookMirror mirror;  // one per symbol
+engine.poll_market_data([&](const lob::MarketData& message) { mirror.apply(message); });
+
+mirror.best_bid();                          // the best bid, if there is one
+mirror.quantity_at(lob::Side::Sell, 15'010); // the total resting at a price
+```
+
+There are four kinds of message:
+
+| Message | Says |
+|---|---|
+| `BestPrices` | The best bid and ask and the quantity at each, whenever either changes. |
+| `Level` | The total now resting at one price on one side. Zero means nothing is left there. |
+| `Trade` | A trade: its price, its size and the side of the incoming order. |
+| `Clear` | Forget this symbol's depth; a fresh picture follows. |
+
+How it is built to be read:
+
+- **Totals, not changes.** A `Level` message gives the quantity at a price, not
+  how much was added or removed. A reader that misses one is wrong only about
+  that price, and only until it next changes.
+- **Numbered per symbol.** Each symbol's messages are numbered from 1 with no
+  gaps, so a jump means some were lost.
+- **Never waited for.** Unlike events, the feed never holds the engine up. If
+  the reader falls behind and the ring fills, the messages that do not fit are
+  dropped and counted in `market_data_dropped()`.
+- **Snapshots.** `engine.request_snapshot(symbol)` publishes a `Clear`, a
+  `Level` for every occupied price and the `BestPrices`: for a reader that has
+  just started or has seen a gap.
+- **One total per price per order.** An order that takes ten orders at one
+  price prints ten trades but gives that price's new total once.
+
+`BookMirror` puts those rules into practice and is what the tests use to check
+that the feed tells the truth. With `ShardedEngine`, each shard has its own
+market data ring, read with `poll_market_data(shard, ...)` or all together. A
+symbol's numbering carries on when it moves to another shard, and the new shard
+starts with a fresh picture of it, so a reader that ignores messages older than
+the last it applied stays right across the move.
 
 ### Pinning the engine thread to a core
 
@@ -346,6 +396,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/shard_assignment_test.cpp](tests/shard_assignment_test.cpp) | Equal loads dealt in turn, busy symbols kept apart, no shard left empty, and 400 random cases checked against the best possible split. |
 | [tests/symbol_move_test.cpp](tests/symbol_move_test.cpp) | Moving a symbol between shards: orders and IDs survive, events stay in order, queued and repeated moves, full rings, stopping or destroying the engine mid-move, and 12,000 random commands with hundreds of random moves compared, symbol by symbol, with each symbol running alone. |
 | [tests/load_by_time_test.cpp](tests/load_by_time_test.cpp) | Timing a sample of commands: expensive commands told from cheap ones, a sample agreeing with timing everything, regular order patterns not fooling the sampling, interruptions capped, and rebalancing by time catching an imbalance that counting commands cannot see. |
+| [tests/market_data_test.cpp](tests/market_data_test.cpp) | Which messages each kind of command produces, snapshots, a slow reader recovering from dropped messages, 6,000 random commands with a mirror checked against the book after every one, and mirrors checked against the books after random traffic and moves across three shard threads. |
 | [tests/rebalance_test.cpp](tests/rebalance_test.cpp) | The rebalancing decision on its own, including 300 random cases showing that repeated moves only ever improve things and always stop; and the engine moving a busy symbol off an overloaded shard, settling, following a shift in traffic, and doing it all unprompted. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
@@ -376,6 +427,7 @@ To run only the headline numbers:
 | `BM_SpscRing_TwoThreads`, `BM_MutexRing_TwoThreads` | Time per `Trade` delivered from one thread to another, through the ring and through the same ring guarded by a mutex. |
 | `BM_Engine_RoundTrip` | One command sent to the engine thread and its answer received: both rings plus the book. |
 | `BM_Engine_PerCommand/N` | The engine's cost per command on one thread, timing one command in N: 0 for no timing, 64 the default, 1 for every command. Divide the time shown by 512, or read `items_per_second`. |
+| `BM_Engine_MarketDataFeed/N` | The same loop with the market data feed off (0) and on (1), in the case where every command changes the best price's quantity and so publishes two messages. |
 | `BM_Engine_Throughput/N` | Commands per second through the whole pipeline when the sender does not wait for answers, with the orders spread over N symbols. |
 | `BM_Sharded_Throughput/N` | Total commands per second across N shards, each with its own feeder thread: 2N busy threads in all. |
 | `BM_Sharded_MoveSymbol` | How long one move takes between two otherwise idle shards. |
@@ -408,6 +460,7 @@ with other programs running: no core isolation, no pinning.
 | `BM_Sharded_MoveSymbol` | about 450 to 530 ns per move |
 | `BM_Sharded_RebalanceLook/16`, `/256`, `/4096` | about 85 ns, 1.1 µs and 18 µs per look. At one look per 100,000 commands with 256 symbols, that is about a hundredth of a nanosecond per command. |
 | `BM_Engine_PerCommand/0`, `/64`, `/1` | Timing one command in 64 costs nothing measurable next to no timing at all. Timing every command adds about 45% to the engine's cost per command, which is why it samples. |
+| `BM_Engine_MarketDataFeed/0`, `/1` | about 21 ns per command with the feed off and 34 ns with it on, publishing two messages per command: about 6 ns a message. Off, it costs nothing. |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
@@ -419,6 +472,9 @@ machine is; run them on the hardware you care about.
 - **Rebalancing is off unless you ask for it.** Symbols are dealt in turn, or by the loads you supply, at start-up. After that a symbol moves only when you call `move_symbol` or `rebalance`, or set `RebalanceConfig::every`.
 - **Rebalancing is cautious, not optimal.** It moves one symbol at a time, from the busiest shard to the quietest, and only if that at least halves the gap between them. It will not split up two shards that are each dominated by one busy symbol, and it only ever compares the busiest shard with the quietest.
 - **Automatic rebalancing needs a single feeder thread.** It runs inside `submit` and `cancel` and may move a symbol, which only the thread feeding every shard may do. With a feeder thread per shard, leave it off.
+- **The market data feed drops rather than waits.** A reader that falls behind loses messages and must notice the gap in the numbering and ask for a snapshot. Size the ring for the deepest book you expect to snapshot: a snapshot is one message per occupied price, and it can be cut short by a full ring like anything else.
+- **The feed costs something on every order when it is on:** up to two messages for an order that changes the best price. It is off by default.
+- **A snapshot is not atomic to the reader.** It arrives as ordinary messages, and orders handled after it follow straight on.
 - **Time spent is an estimate.** It comes from timing one command in 64, so it is noisier than a count, and it is in the CPU counter's own units, good for comparing symbols but not for reading as seconds. Commands handled is still the default measure.
 - **The stopwatch can be fooled in one direction.** A sample that took far longer than usual is capped at 64 times the recent average, on the assumption that the thread was interrupted. A symbol that suddenly becomes genuinely expensive is therefore undercounted for its first few samples.
 - **A move pauses its destination.** The new shard waits, for all of its symbols, until the old shard has worked through its queue and `poll` has read its events. Idle shards hand over in about half a microsecond; a backlog on the old shard, or a slow reader, makes it longer.
@@ -457,7 +513,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 14 — Moving a symbol between shards while the engine is running
 - [x] Phase 15 — Rebalancing automatically from measured load
 - [x] Phase 16 — Measuring load by time spent rather than commands handled
-- [ ] Next — A market data feed: publishing the best prices and depth as they change
+- [x] Phase 17 — A market data feed: best prices, depth and trades
+- [ ] Next — Recording and replaying a session, to reproduce a run exactly
 
 ## Layout
 

@@ -129,4 +129,44 @@ void BM_Engine_PerCommand(benchmark::State& state) {
 }
 BENCHMARK(BM_Engine_PerCommand)->Arg(0)->Arg(64)->Arg(1);
 
+// The same loop with the market data feed off (0) and on (1). Every command
+// here changes the quantity at the best price, so with the feed on each one
+// publishes two messages: the price's new total and the new best prices. That
+// is the feed at its most expensive.
+void BM_Engine_MarketDataFeed(benchmark::State& state) {
+  constexpr int kBatch = 256;
+  const bool feed_on = state.range(0) != 0;
+  lob::MatchingEngine engine(
+      {.books = {kBook}, .market_data_capacity = feed_on ? std::size_t{1} << 12 : 0});
+  std::vector<OrderId> resting;
+  resting.reserve(kBatch);
+  std::uint64_t tag = 0;
+  std::uint64_t messages = 0;
+  const auto read_feed = [&] {
+    messages += engine.poll_market_data([](const lob::MarketData&) {});
+  };
+
+  for (auto _ : state) {
+    for (int i = 0; i < kBatch; ++i) {
+      bool sent = engine.submit(tag++, 0, Side::Buy, kPrice, 100);
+      benchmark::DoNotOptimize(sent);
+    }
+    engine.process_pending();
+    engine.poll([&](const Event& event) { resting.push_back(event.order_id); });
+    read_feed();
+    for (const OrderId id : resting) {
+      bool sent = engine.cancel(tag++, 0, id);
+      benchmark::DoNotOptimize(sent);
+    }
+    engine.process_pending();
+    engine.poll([](const Event&) {});
+    read_feed();
+    resting.clear();
+  }
+  state.SetItemsProcessed(state.iterations() * 2 * kBatch);
+  state.counters["messages_per_command"] =
+      static_cast<double>(messages) / static_cast<double>(state.iterations() * 2 * kBatch);
+}
+BENCHMARK(BM_Engine_MarketDataFeed)->Arg(0)->Arg(1);
+
 }  // namespace
