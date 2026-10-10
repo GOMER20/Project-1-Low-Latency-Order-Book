@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -18,6 +19,7 @@
 #include "lob/compiler.hpp"
 #include "lob/messages.hpp"
 #include "lob/order_book.hpp"
+#include "lob/recording.hpp"
 #include "lob/spsc_ring.hpp"
 #include "lob/thread_affinity.hpp"
 
@@ -45,6 +47,15 @@ struct EngineConfig {
   // the market data feed off, which is the default: it costs something on
   // every order, and not every use of the engine wants it.
   std::size_t market_data_capacity = 0;
+
+  // A file to record the session in: every command the engine is sent, in
+  // order, so that the session can be replayed later. See recording.hpp and
+  // replay.hpp. Empty, the default, records nothing.
+  std::string record_to = {};
+
+  // How many commands may be waiting to be written to that file before the
+  // engine starts refusing new ones; rounded up to a power of two.
+  std::size_t recording_capacity = 1 << 16;
 };
 
 // Decides how much of one timed command to count, and keeps `typical_x256` up
@@ -158,19 +169,27 @@ class MatchingEngine {
       owned_.push_back(std::make_unique<OrderBook>(config.books[symbol]));
       books_[symbol] = owned_.back().get();
     }
+    if (!config.record_to.empty()) {
+      own_recorder_ = std::make_unique<SessionRecorder>(config.record_to, config.books,
+                                                        config.recording_capacity);
+      recorder_ = own_recorder_.get();
+    }
   }
 
   // One engine of a group that can pass symbols between its members; this is
   // how ShardedEngine builds its shards. The books belong to the directory's
   // owner and must outlive the engine. The engine starts out running the
-  // symbols listed in `running`; config.books is ignored.
+  // symbols listed in `running`; config.books and config.record_to are
+  // ignored. If the group is recording its session, `recorder` is where: one
+  // recorder for the whole group, which must outlive the engine too.
   MatchingEngine(const EngineConfig& config, SymbolDirectory& directory,
-                 std::span<const SymbolId> running)
+                 std::span<const SymbolId> running, SessionRecorder* recorder = nullptr)
       : books_(directory.books.size(), nullptr),
         handled_(directory.books.size()),
         timed_(directory.books.size()),
         directory_(&directory),
         feeds_(directory.feeds.data()),
+        recorder_(recorder),
         commands_(config.command_capacity),
         events_(config.event_capacity),
         market_data_(std::max<std::size_t>(config.market_data_capacity, 1)),
@@ -205,10 +224,15 @@ class MatchingEngine {
   }
 
   // Processes every command that was queued before the call, then joins the
-  // engine thread. Safe to call when the engine is not running.
+  // engine thread. If the engine is recording its session, the recording is
+  // complete on return: see flush_recording(). Safe to call when the engine
+  // is not running.
   void stop() {
     request_stop();
     join();
+    if (own_recorder_ != nullptr) {
+      own_recorder_->flush();
+    }
   }
 
   // The two halves of stop(), for stopping several engines together: ask them
@@ -252,6 +276,10 @@ class MatchingEngine {
   // All of these return false if the command ring is full; the caller decides
   // whether to retry. A command for a symbol the engine is not running is
   // accepted here and answered with Rejected or CancelRejected.
+  //
+  // If the session is being recorded, a command is recorded if and only if it
+  // is queued here, and in the same order. A command also gets false if the
+  // recorder has fallen so far behind that it has no room for it.
 
   [[nodiscard]] bool submit(std::uint64_t client_tag, SymbolId symbol, Side side, Price price,
                             Quantity quantity,
@@ -264,7 +292,7 @@ class MatchingEngine {
     command.side = side;
     command.type = CommandType::Submit;
     command.order_type = order_type;
-    return commands_.try_push(command);
+    return send(command);
   }
 
   [[nodiscard]] bool cancel(std::uint64_t client_tag, SymbolId symbol,
@@ -274,11 +302,12 @@ class MatchingEngine {
     command.order_id = order_id;
     command.symbol = symbol;
     command.type = CommandType::Cancel;
-    return commands_.try_push(command);
+    return send(command);
   }
 
   // The two halves of moving a symbol to another engine of the same group.
   // Only for engines built with a SymbolDirectory; ShardedEngine calls these.
+  // Neither is recorded: ShardedEngine records the move as a whole.
   //
   // detach: once everything queued ahead of it has been handled, the engine
   // stops running the symbol and publishes a Handoff event as its last word
@@ -299,13 +328,42 @@ class MatchingEngine {
   // For a reader that has just started, or has seen a gap in the sequence
   // numbers. Does nothing if the feed is off.
   [[nodiscard]] bool request_snapshot(SymbolId symbol) noexcept {
-    return commands_.try_push(migration_command(CommandType::Snapshot, symbol, 0));
+    return send(migration_command(CommandType::Snapshot, symbol, 0));
   }
 
   // Whether the command ring is full right now. Only the gateway thread adds
   // to the ring, so if it sees room, its next push will succeed.
   [[nodiscard]] bool command_ring_full() const noexcept {
     return commands_.size() == commands_.capacity();
+  }
+
+  // How many commands are queued and not yet handled. Once this is zero, the
+  // engine has dealt with everything sent so far, and every event and market
+  // data message that came of it is waiting to be read, or has been.
+  [[nodiscard]] std::size_t commands_pending() const noexcept { return commands_.size(); }
+
+  // --- Recording: any thread -------------------------------------------------
+
+  // Whether the session is being recorded: a file was asked for, it could be
+  // opened, and every write to it so far has worked. The engine runs either
+  // way, so check this if the recording matters to you.
+  [[nodiscard]] bool recording() const noexcept {
+    return recorder_ != nullptr && recorder_->ok();
+  }
+
+  // Returns once every command sent before the call is in the recording's
+  // file, where another program, or this one, can read it. stop() does this
+  // too. It may be called while the gateway thread carries on sending.
+  void flush_recording() noexcept {
+    if (recorder_ != nullptr) {
+      recorder_->flush();
+    }
+  }
+
+  // Commands written to the recording so far. It trails what has been sent
+  // until flush_recording() returns.
+  [[nodiscard]] std::uint64_t commands_recorded() const noexcept {
+    return recorder_ != nullptr ? recorder_->written() : 0;
   }
 
   // --- Publisher thread ------------------------------------------------------
@@ -411,6 +469,24 @@ class MatchingEngine {
   }
 
  private:
+  // Queues a command for the engine thread and, if the session is being
+  // recorded, records it.
+  //
+  // The recorder is asked for room first. This thread is the only one that
+  // records, so room seen now is still there after the push; a command can
+  // therefore never be queued without being recorded, or recorded without
+  // being queued.
+  [[nodiscard]] bool send(const Command& command) noexcept {
+    if (recorder_ == nullptr) [[likely]] {
+      return commands_.try_push(command);
+    }
+    if (!recorder_->can_record() || !commands_.try_push(command)) {
+      return false;
+    }
+    recorder_->record(command);
+    return true;
+  }
+
   static Command migration_command(CommandType type, SymbolId symbol,
                                    std::uint32_t move_number) noexcept {
     Command command{};
@@ -469,6 +545,7 @@ class MatchingEngine {
         return true;
       case CommandType::Submit:
       case CommandType::Cancel:
+      case CommandType::Move:  // only ever found in a recording
         break;
     }
     return true;
@@ -751,6 +828,9 @@ class MatchingEngine {
   SymbolDirectory* directory_ = nullptr;             // set only for a member of a group
   std::vector<FeedState> own_feeds_;                 // feed state for an engine with its own books
   FeedState* feeds_;                                 // feed state by SymbolId: own, or the group's
+  std::unique_ptr<SessionRecorder> own_recorder_;    // set if this engine records by itself
+  SessionRecorder* recorder_ = nullptr;              // where commands are recorded, if anywhere:
+                                                     // its own recorder, or the group's
   SpscRing<Command> commands_;
   SpscRing<Event> events_;
   SpscRing<MarketData> market_data_;

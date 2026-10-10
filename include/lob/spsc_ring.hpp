@@ -54,6 +54,19 @@ class SpscRing {
     return true;
   }
 
+  // Producer thread only. Whether there is room for one more item. Only the
+  // producer adds to the ring, so if this returns true, its next try_push is
+  // certain to succeed. That lets a producer feeding two rings make sure of
+  // both before it puts anything in either.
+  [[nodiscard]] bool can_push() noexcept {
+    const std::size_t tail = tail_.load(std::memory_order_relaxed);
+    if (tail - head_cache_ == capacity()) {
+      head_cache_ = head_.load(std::memory_order_acquire);
+      return tail - head_cache_ != capacity();
+    }
+    return true;
+  }
+
   // Consumer thread only. Returns false if the ring is empty.
   [[nodiscard]] bool try_pop(T& out) noexcept {
     const std::size_t head = head_.load(std::memory_order_relaxed);

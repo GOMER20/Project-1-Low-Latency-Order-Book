@@ -16,6 +16,10 @@ enum class CommandType : std::uint8_t {
   Attach,  // start running this symbol, once it has been let go
   // Asks for a fresh picture of one symbol on the market data feed.
   Snapshot,
+  // Never sent to an engine. It appears only in a recording of a session, to
+  // say that the symbol was moved to another shard at this point; `quantity`
+  // carries the shard it went to. See recording.hpp.
+  Move,
 };
 
 // A request sent to the engine thread.
