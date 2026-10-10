@@ -73,6 +73,34 @@ TEST(SpscRing, EverySlotIsUsableAndAFullRingRejectsPushes) {
   EXPECT_FALSE(ring.try_pop(value));
 }
 
+// can_push() must say exactly what try_push() would do, including just after
+// the consumer has made room that the producer has not noticed yet.
+TEST(SpscRing, CanPushSaysWhetherTheNextPushWillFit) {
+  SpscRing<int> ring(4);
+  int value = -1;
+  for (int lap = 0; lap < 10; ++lap) {
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_TRUE(ring.can_push());
+      ASSERT_TRUE(ring.can_push());  // asking changes nothing
+      ASSERT_TRUE(ring.try_push(i));
+    }
+    ASSERT_FALSE(ring.can_push());
+    ASSERT_FALSE(ring.try_push(99));
+    ASSERT_EQ(ring.size(), 4u);
+
+    ASSERT_TRUE(ring.try_pop(value));  // one slot comes free
+    ASSERT_TRUE(ring.can_push());
+    ASSERT_TRUE(ring.try_push(4));
+    ASSERT_FALSE(ring.can_push());
+
+    for (int i = 1; i <= 4; ++i) {
+      ASSERT_TRUE(ring.try_pop(value));
+      ASSERT_EQ(value, i);
+    }
+    ASSERT_TRUE(ring.can_push());
+  }
+}
+
 TEST(SpscRing, SingleSlotRingAlternatesBetweenFullAndEmpty) {
   SpscRing<int> ring(1);
   int value = -1;
@@ -187,6 +215,41 @@ TEST(SpscRingThreads, EveryItemArrivesOnceAndInOrder) {
 
 // Each message fills most of a cache line with values derived from its
 // sequence number, so a half-written message would be detected.
+// A producer that only pushes after can_push() has said yes must never be
+// turned away, however the consumer is doing.
+TEST(SpscRingThreads, APushAfterCanPushAlwaysFits) {
+  constexpr std::uint64_t kItems = 200'000;
+  SpscRing<std::uint64_t> ring(8);
+  std::uint64_t surprises = 0;
+
+  std::thread producer([&] {
+    for (std::uint64_t i = 0; i < kItems;) {
+      if (!ring.can_push()) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (!ring.try_push(i)) {
+        ++surprises;
+        continue;
+      }
+      ++i;
+    }
+  });
+
+  std::uint64_t expected = 0;
+  while (expected < kItems) {
+    std::uint64_t value = 0;
+    if (ring.try_pop(value)) {
+      ASSERT_EQ(value, expected);
+      ++expected;
+    } else {
+      std::this_thread::yield();
+    }
+  }
+  producer.join();
+  EXPECT_EQ(surprises, 0u);
+}
+
 TEST(SpscRingThreads, MessagesAreNeverTornWhenDraining) {
   struct Message {
     std::uint64_t sequence;

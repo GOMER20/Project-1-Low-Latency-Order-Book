@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -58,12 +59,19 @@ struct ShardedConfig {
   std::vector<int> pin_to_cpus = {};       // optional: the CPU for each shard, in order (Linux only)
   std::uint32_t time_one_in = 64;          // see EngineConfig::time_one_in; 0 turns timing off
   std::size_t market_data_capacity = 0;    // per shard; 0 turns the market data feed off
+
+  // A file to record the session in, so that it can be replayed later; see
+  // EngineConfig::record_to. Empty records nothing. The commands for every
+  // shard go into the one recording, in the order they were sent, and so do
+  // the moves. Turn this on only if one thread feeds every shard.
+  std::string record_to = {};
+  std::size_t recording_capacity = 1 << 16;  // see EngineConfig::recording_capacity
 };
 
 // What became of a command handed to a ShardedEngine.
 enum class SendStatus : std::uint8_t {
   Sent,           // queued for its shard
-  RingFull,       // a command ring is full; try again
+  RingFull,       // a command ring is full, or the recording has fallen behind; try again
   UnknownSymbol,  // no such symbol (or, for a move, no such shard); retrying will not help
 };
 
@@ -105,6 +113,9 @@ enum class SendStatus : std::uint8_t {
 //   move_symbol()        the thread that feeds both shards involved
 //   rebalance()          the thread that feeds every shard
 //   start(), stop()      one controlling thread
+//
+// If the session is being recorded, one thread must feed every shard: there
+// is one recording, and it has room for one writer.
 //
 // Order. Events for one symbol arrive in the order they happened, including
 // across a move. Events for symbols on different shards have no order
@@ -155,6 +166,11 @@ class ShardedEngine {
     balance_.where.assign(config.books.size(), 0);
     balance_.carried.assign(shard_count, 0);
 
+    if (!config.record_to.empty()) {
+      recorder_ = std::make_unique<SessionRecorder>(config.record_to, config.books,
+                                                    config.recording_capacity);
+    }
+
     shards_.reserve(shard_count);
     for (std::size_t shard = 0; shard < shard_count; ++shard) {
       const EngineConfig shard_config{
@@ -166,8 +182,8 @@ class ShardedEngine {
           .time_one_in = config.time_one_in,
           .market_data_capacity = config.market_data_capacity,
       };
-      shards_.push_back(
-          std::make_unique<MatchingEngine>(shard_config, directory_, running[shard]));
+      shards_.push_back(std::make_unique<MatchingEngine>(shard_config, directory_,
+                                                         running[shard], recorder_.get()));
     }
   }
 
@@ -188,8 +204,9 @@ class ShardedEngine {
   }
 
   // Each shard handles everything already queued for it, including any move
-  // in progress, then its thread is joined. Safe to call when the shards are
-  // not running.
+  // in progress, then its thread is joined. If the session is being recorded,
+  // the recording is complete on return. Safe to call when the shards are not
+  // running.
   void stop() {
     // All are asked first: a shard finishing a move may be waiting on another.
     for (const auto& shard : shards_) {
@@ -198,7 +215,11 @@ class ShardedEngine {
     for (const auto& shard : shards_) {
       shard->join();
     }
+    flush_recording();
   }
+
+  // Whether the shards' threads are running.
+  [[nodiscard]] bool running() const noexcept { return shards_.front()->running(); }
 
   // Whether this shard's thread is bound to the CPU it was given.
   [[nodiscard]] bool pinned(std::size_t shard) const noexcept {
@@ -307,6 +328,9 @@ class ShardedEngine {
   // RingFull if either shard's command ring is full, in which case nothing has
   // changed and the call can be repeated, and UnknownSymbol if there is no
   // such symbol or shard.
+  //
+  // A move that is started is written into the recording, if there is one, at
+  // the point in the stream of commands where it happened.
   [[nodiscard]] SendStatus move_symbol(SymbolId symbol, std::size_t to_shard) noexcept {
     if (symbol >= shard_of_.size() || to_shard >= shards_.size()) [[unlikely]] {
       return SendStatus::UnknownSymbol;
@@ -319,7 +343,8 @@ class ShardedEngine {
     MatchingEngine& to = *shards_[to_shard];
     // This thread is the only one adding to either ring, so if both have room
     // now, both pushes below are certain to succeed.
-    if (from.command_ring_full() || to.command_ring_full()) {
+    if (from.command_ring_full() || to.command_ring_full() ||
+        (recorder_ != nullptr && !recorder_->can_record())) {
       return SendStatus::RingFull;
     }
 
@@ -331,6 +356,14 @@ class ShardedEngine {
     assert(let_go_queued && take_up_queued);
     static_cast<void>(let_go_queued);
     static_cast<void>(take_up_queued);
+
+    if (recorder_ != nullptr) {
+      Command moved{};
+      moved.quantity = static_cast<Quantity>(to_shard);
+      moved.symbol = symbol;
+      moved.type = CommandType::Move;
+      recorder_->record(moved);
+    }
     return SendStatus::Sent;
   }
 
@@ -419,6 +452,35 @@ class ShardedEngine {
   // How many moves rebalance() has started. Gateway thread only.
   [[nodiscard]] std::uint64_t rebalancing_moves() const noexcept {
     return balance_.moves_started;
+  }
+
+  // How many commands are queued for the shards and not yet handled; see
+  // MatchingEngine::commands_pending(). A move under way counts until the new
+  // shard has taken the symbol up.
+  [[nodiscard]] std::size_t commands_pending() const noexcept {
+    std::size_t total = 0;
+    for (const auto& shard : shards_) {
+      total += shard->commands_pending();
+    }
+    return total;
+  }
+
+  // --- Recording: any thread -------------------------------------------------
+  // See the functions of the same names in MatchingEngine.
+
+  [[nodiscard]] bool recording() const noexcept {
+    return recorder_ != nullptr && recorder_->ok();
+  }
+
+  void flush_recording() noexcept {
+    if (recorder_ != nullptr) {
+      recorder_->flush();
+    }
+  }
+
+  // Commands and moves written to the recording so far.
+  [[nodiscard]] std::uint64_t commands_recorded() const noexcept {
+    return recorder_ != nullptr ? recorder_->written() : 0;
   }
 
   // --- Publisher threads -----------------------------------------------------
@@ -590,6 +652,7 @@ class ShardedEngine {
   std::vector<std::atomic<std::uint32_t>> moves_;         // how many times each has been moved
   RebalanceConfig rebalance_;
   Balance balance_;
+  std::unique_ptr<SessionRecorder> recorder_;             // set if the session is recorded
   std::vector<std::unique_ptr<MatchingEngine>> shards_;   // last: destroyed first
 };
 

@@ -17,6 +17,10 @@ A book is single-threaded and handles one symbol. `MatchingEngine` runs one book
 per symbol on a thread of its own, taking orders in and sending trades out
 through lock-free ring buffers, so no other thread can ever block it.
 
+Because a book's behaviour depends only on the orders it is sent, a whole
+session can be recorded to a file and replayed later, reproducing every trade
+and every order ID exactly.
+
 ## Design
 
 | Piece | File | What it does |
@@ -32,6 +36,8 @@ through lock-free ring buffers, so no other thread can ever block it.
 | `BookMirror` | [include/lob/book_mirror.hpp](include/lob/book_mirror.hpp) | A symbol's prices and depth rebuilt from the market data feed: the reference for how to read it. For the reading side, so it uses ordinary containers. |
 | `MatchingEngine` | [include/lob/matching_engine.hpp](include/lob/matching_engine.hpp) | One `OrderBook` per symbol, all on one engine thread between a command ring and an event ring. The thread can be pinned to a CPU. |
 | `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread and rings, to use more than one core. It owns every book, decides which shard runs each symbol, and can move a symbol to another shard while running. |
+| `SessionRecorder`, `Recording` | [include/lob/recording.hpp](include/lob/recording.hpp) | Writing a session's commands to a file as they are sent, through a ring and a writer thread so that the sender never waits for the disk; and reading such a file back. |
+| `replay`, `SessionDigest` | [include/lob/replay.hpp](include/lob/replay.hpp) | Feeding a recorded session to a fresh engine, which then does exactly what the original did; and a fingerprint of an engine's output for checking that it did. |
 | `assign_shards`, `choose_rebalancing_move` | [include/lob/shard_assignment.hpp](include/lob/shard_assignment.hpp) | The two placement decisions: which shard each symbol starts on, given how busy each is expected to be, and which single symbol to move when the shards have drifted out of balance. |
 
 Design rules followed throughout:
@@ -334,6 +340,80 @@ Two things differ from a single engine:
   when the symbol is moved between shards. Events
   for symbols on different shards have no order relative to each other.
 
+### Recording and replaying a session
+
+An order book is a deterministic machine: what it does depends on nothing but
+the commands it is given and the order they arrive in. So a session can be
+reproduced exactly by writing down its commands and feeding them to a fresh
+engine. That is how an exchange rebuilds its books after a failure, and it is
+what you want when a bug shows up once, six hours into live trading.
+
+Name a file, and the engine records every command it is sent:
+
+```cpp
+lob::MatchingEngine engine({.books = {book_config}, .record_to = "session.rec"});
+if (!engine.recording()) {
+  // The file could not be opened. The engine is running anyway, unrecorded.
+}
+engine.start();
+// ... a day's trading ...
+engine.stop();  // the recording is complete once this returns
+```
+
+Later, in this program or another, load the file and replay it:
+
+```cpp
+#include "lob/replay.hpp"
+
+const std::optional<lob::Recording> recording = lob::Recording::load("session.rec");
+lob::MatchingEngine again({.books = recording->books()});  // the books are in the file
+
+lob::replay(recording->commands(), again, [&](const lob::Event& event) {
+  // Every event of the session, again: print it, or stop on the one you are after.
+});
+```
+
+The replay gives every symbol the same events in the same order, with the same
+order IDs, the same fills against the same resting orders and the same
+refusals. Its market data is the same message for message, down to the
+sequence numbers, and it leaves the same orders in the same queues.
+
+- **The thread sending orders never touches the file.** To record a command it
+  copies 32 bytes into a ring, and a thread of the recorder's own writes them
+  out. A slow disk holds up that thread, not the sender.
+- **Nothing is ever left out.** A recording with a hole in it would be
+  useless, so if the writer falls so far behind that its ring fills, `submit`
+  returns false, exactly as it does when the engine's own ring is full, and the
+  sender tries again. A command is in the recording if and only if the engine
+  took it.
+- **Any shape of engine.** `ShardedEngine` takes `record_to` as well and puts
+  every shard's commands in one file. A session recorded on eight shards
+  replays on a single engine that has not been started, which `replay` then
+  runs itself on the calling thread: the easy way to step through it in a
+  debugger.
+- **Moves are recorded too,** whether you made them or rebalancing did. Which
+  shard runs a symbol changes nothing the symbol says, except that on arriving
+  it puts a fresh picture of itself on the market data feed. So a move is
+  replayed as a request for that snapshot, which keeps the feed exact on any
+  engine. Pass `{.repeat_moves = true}` and a `ShardedEngine` really moves the
+  symbol, to the same shard at the same point, for looking into the moving
+  itself.
+- **Stop anywhere.** `recording->commands().first(n)` replays the session up
+  to its n-th command and leaves the books as they stood at that moment.
+- **Checking a replay takes one line.** `lob::SessionDigest` is a fingerprint
+  of everything an engine said. Give every event, and every market data
+  message, to one digest during the session and to another during the replay;
+  if the two are equal, so was the output.
+- **A crash leaves a usable file.** There is no count and no end marker. A file
+  cut off part-way through a command loads as every whole command before the
+  cut, with `damaged()` set. While the session runs, `flush_recording()` makes
+  everything sent so far readable.
+
+The file is a 24-byte header, 32 bytes for each book and 32 bytes for each
+command, laid out by hand with no padding, so the same session always gives
+the same bytes: recording a replay produces the same file again, byte for
+byte. The layout is in [include/lob/recording.hpp](include/lob/recording.hpp).
+
 ## Build
 
 Dependencies on Ubuntu or WSL:
@@ -388,8 +468,8 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/matching_test.cpp](tests/matching_test.cpp) | Price priority, time priority, trade prices, remainders. |
 | [tests/edge_case_test.cpp](tests/edge_case_test.cpp) | Partial fills, queue jumping, full cancellations, crossing the spread. |
 | [tests/model_test.cpp](tests/model_test.cpp) | 66,000 random operations, covering all four order types, compared step by step against a naive `std::map` reference book. |
-| [tests/allocation_test.cpp](tests/allocation_test.cpp) | Replaces global `operator new` and asserts that nothing allocates after construction. Built as its own binary and left out of sanitizer builds, whose runtimes replace `operator new` themselves. |
-| [tests/spsc_ring_test.cpp](tests/spsc_ring_test.cpp) | FIFO order, full and empty, wrap-around, and two-thread transfers that check nothing is lost, reordered or torn. |
+| [tests/allocation_test.cpp](tests/allocation_test.cpp) | Replaces global `operator new` and asserts that nothing allocates after construction, including while a session is being recorded and while one is replayed. Built as its own binary and left out of sanitizer builds, whose runtimes replace `operator new` themselves. |
+| [tests/spsc_ring_test.cpp](tests/spsc_ring_test.cpp) | FIFO order, full and empty, wrap-around, asking for room before pushing, and two-thread transfers that check nothing is lost, reordered or torn. |
 | [tests/matching_engine_test.cpp](tests/matching_engine_test.cpp) | Every event type, start, stop and restart, shutdown with nobody reading, and 6,000 random commands for three books through 4-slot rings compared event for event against a single-threaded run. |
 | [tests/multi_symbol_test.cpp](tests/multi_symbol_test.cpp) | Routing by symbol, unknown symbols, per-book order IDs and limits, and 9,000 interleaved commands checked against running each symbol alone. |
 | [tests/sharded_engine_test.cpp](tests/sharded_engine_test.cpp) | How symbols are dealt to shards, routing and symbol IDs, one feeder thread per shard, and 12,000 random commands through three shard threads compared, symbol by symbol, with each symbol running alone. |
@@ -397,6 +477,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/symbol_move_test.cpp](tests/symbol_move_test.cpp) | Moving a symbol between shards: orders and IDs survive, events stay in order, queued and repeated moves, full rings, stopping or destroying the engine mid-move, and 12,000 random commands with hundreds of random moves compared, symbol by symbol, with each symbol running alone. |
 | [tests/load_by_time_test.cpp](tests/load_by_time_test.cpp) | Timing a sample of commands: expensive commands told from cheap ones, a sample agreeing with timing everything, regular order patterns not fooling the sampling, interruptions capped, and rebalancing by time catching an imbalance that counting commands cannot see. |
 | [tests/market_data_test.cpp](tests/market_data_test.cpp) | Which messages each kind of command produces, snapshots, a slow reader recovering from dropped messages, 6,000 random commands with a mirror checked against the book after every one, and mirrors checked against the books after random traffic and moves across three shard threads. |
+| [tests/replay_test.cpp](tests/replay_test.cpp) | Recording: every command in order, none lost when the writer falls behind, none recorded that the engine refused, files that are cut short, damaged or not recordings at all. Replaying: random sessions of 20,000 commands on a running engine, and on four shards with dozens of moves, reproduced event for event, message for message and order for order on engines of other shapes; stopping part-way; and a recorded replay giving the same file byte for byte. |
 | [tests/rebalance_test.cpp](tests/rebalance_test.cpp) | The rebalancing decision on its own, including 300 random cases showing that repeated moves only ever improve things and always stop; and the engine moving a busy symbol off an overloaded shard, settling, following a shift in traffic, and doing it all unprompted. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
@@ -432,9 +513,18 @@ To run only the headline numbers:
 | `BM_Sharded_Throughput/N` | Total commands per second across N shards, each with its own feeder thread: 2N busy threads in all. |
 | `BM_Sharded_MoveSymbol` | How long one move takes between two otherwise idle shards. |
 | `BM_Sharded_RebalanceLook/N` | What one look by `rebalance()` costs with N symbols on four shards. |
+| `BM_Recording_PerCommand/N` | The engine's cost per command on one thread with recording off (0) and on (1). Divide the time shown by 512, or read `items_per_second`. |
+| `BM_Recording_Throughput/N` | Commands per second through the whole pipeline with recording off (0) and on (1). |
+| `BM_Recording_ToFile` | Two million commands recorded to a real file, 64 MB of it, including the wait for the last of them to be written. |
+| `BM_Replay_ByHand` | Replaying a session of 65,536 commands that is already in memory into an engine run by hand; see `items_per_second`. |
 
 The deep-book benchmarks shuffle their orders first, so resting orders and free
 slots are scattered through memory rather than laid out in insertion order.
+
+`BM_Recording_PerCommand` and `BM_Recording_Throughput` record to `/dev/null`:
+they measure what recording costs the thread sending orders, and at tens of
+millions of commands a second a real file would reach a gigabyte before the
+benchmark was over. `BM_Recording_ToFile` is the one that writes to disk.
 
 ### Results
 
@@ -461,6 +551,10 @@ with other programs running: no core isolation, no pinning.
 | `BM_Sharded_RebalanceLook/16`, `/256`, `/4096` | about 85 ns, 1.1 µs and 18 µs per look. At one look per 100,000 commands with 256 symbols, that is about a hundredth of a nanosecond per command. |
 | `BM_Engine_PerCommand/0`, `/64`, `/1` | Timing one command in 64 costs nothing measurable next to no timing at all. Timing every command adds about 45% to the engine's cost per command, which is why it samples. |
 | `BM_Engine_MarketDataFeed/0`, `/1` | about 21 ns per command with the feed off and 34 ns with it on, publishing two messages per command: about 6 ns a message. Off, it costs nothing. |
+| `BM_Recording_PerCommand/0`, `/1` | about 17 ns per command without recording and 21 ns with it: recording costs the sending thread about 4 ns a command. An engine that is not recording runs at the same speed as before recording existed. |
+| `BM_Recording_Throughput/0`, `/1` | 16 to 17 million commands per second without recording and 14.5 to 15 million with it, 7 to 15% lower. |
+| `BM_Recording_ToFile` | about 25 million commands per second written to a real file, 780 MB of recording a second, while the same thread also runs the engine. |
+| `BM_Replay_ByHand` | 30 to 33 million commands replayed per second: an hour of trading at 10,000 orders a second replays in about a second. |
 
 Results depend on the CPU, and the percentiles also depend on how quiet the
 machine is; run them on the hardware you care about.
@@ -475,6 +569,14 @@ machine is; run them on the hardware you care about.
 - **The market data feed drops rather than waits.** A reader that falls behind loses messages and must notice the gap in the numbering and ask for a snapshot. Size the ring for the deepest book you expect to snapshot: a snapshot is one message per occupied price, and it can be cut short by a full ring like anything else.
 - **The feed costs something on every order when it is on:** up to two messages for an order that changes the best price. It is off by default.
 - **A snapshot is not atomic to the reader.** It arrives as ordinary messages, and orders handled after it follow straight on.
+- **A recording holds the order of the commands, not their timing.** A replay runs as fast as the engine will take them, so it reproduces what happened, not how long it took.
+- **A recording is the input, not the output.** Events and market data are not stored; they are produced again by the replay. To compare a replay with the original, keep a `SessionDigest` of the original.
+- **A replay starts from empty books.** There is no saved state to start from part-way, so reaching the last minute of a session means replaying all of it. That is quick, but not free.
+- **Recording needs a single feeder thread,** like automatic rebalancing: one recording has room for one writer.
+- **A disk that cannot keep up eventually slows the sender.** The recorder's ring absorbs bursts, 65,536 commands by default. Once it is full, commands are refused until the writer catches up, because the alternative is a recording with holes in it.
+- **The recording is handed to the operating system, not forced onto the disk.** It survives the program crashing. It does not promise to survive the machine losing power.
+- **A recording is read back whole, into memory,** at 32 bytes a command, and on the same kind of machine: the numbers in it are in the recording machine's byte order, and a file from the other kind is refused rather than misread.
+- **A replay gets the whole market data feed,** including any messages the original reader was too slow to receive. The sequence numbers are the same either way.
 - **Time spent is an estimate.** It comes from timing one command in 64, so it is noisier than a count, and it is in the CPU counter's own units, good for comparing symbols but not for reading as seconds. Commands handled is still the default measure.
 - **The stopwatch can be fooled in one direction.** A sample that took far longer than usual is capped at 64 times the recent average, on the assumption that the thread was interrupted. A symbol that suddenly becomes genuinely expensive is therefore undercounted for its first few samples.
 - **A move pauses its destination.** The new shard waits, for all of its symbols, until the old shard has worked through its queue and `poll` has read its events. Idle shards hand over in about half a microsecond; a backlog on the old shard, or a slow reader, makes it longer.
@@ -514,7 +616,8 @@ machine is; run them on the hardware you care about.
 - [x] Phase 15 — Rebalancing automatically from measured load
 - [x] Phase 16 — Measuring load by time spent rather than commands handled
 - [x] Phase 17 — A market data feed: best prices, depth and trades
-- [ ] Next — Recording and replaying a session, to reproduce a run exactly
+- [x] Phase 18 — Recording a session to a file and replaying it exactly
+- [ ] Next — Saving the books part-way through, so that a replay need not start from the beginning
 
 ## Layout
 
