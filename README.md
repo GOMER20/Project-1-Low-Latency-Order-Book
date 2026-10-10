@@ -21,6 +21,11 @@ Because a book's behaviour depends only on the orders it is sent, a whole
 session can be recorded to a file and replayed later, reproducing every trade
 and every order ID exactly.
 
+`hft` wraps all of it as a program that other programs talk to over a local
+socket, so the engine can run inside an application written in any language.
+It adds a house to trade against, tells both sides of every trade, and keeps
+statistics on how it performed.
+
 ## Design
 
 | Piece | File | What it does |
@@ -38,6 +43,7 @@ and every order ID exactly.
 | `ShardedEngine` | [include/lob/sharded_engine.hpp](include/lob/sharded_engine.hpp) | Several `MatchingEngine`s side by side, each with its own thread and rings, to use more than one core. It owns every book, decides which shard runs each symbol, and can move a symbol to another shard while running. |
 | `SessionRecorder`, `Recording` | [include/lob/recording.hpp](include/lob/recording.hpp) | Writing a session's commands to a file as they are sent, through a ring and a writer thread so that the sender never waits for the disk; and reading such a file back. |
 | `replay`, `SessionDigest` | [include/lob/replay.hpp](include/lob/replay.hpp) | Feeding a recorded session to a fresh engine, which then does exactly what the original did; and a fingerprint of an engine's output for checking that it did. |
+| HFT | [hft/](hft/) | The engine as a program: a socket server, the house's orders, per-client fills, statistics, a market simulator and a Node.js client. See [HFT: the engine as a program](#hft-the-engine-as-a-program). |
 | `assign_shards`, `choose_rebalancing_move` | [include/lob/shard_assignment.hpp](include/lob/shard_assignment.hpp) | The two placement decisions: which shard each symbol starts on, given how busy each is expected to be, and which single symbol to move when the shards have drifted out of balance. |
 
 Design rules followed throughout:
@@ -408,11 +414,132 @@ sequence numbers, and it leaves the same orders in the same queues.
   cut off part-way through a command loads as every whole command before the
   cut, with `damaged()` set. While the session runs, `flush_recording()` makes
   everything sent so far readable.
+- **A limit, if you want one.** `recording_limit` stops the recording after
+  that many commands, for an engine left running for days. The file is then
+  the start of the session and replays as the session up to that point.
 
 The file is a 24-byte header, 32 bytes for each book and 32 bytes for each
 command, laid out by hand with no padding, so the same session always gives
 the same bytes: recording a replay produces the same file again, byte for
 byte. The layout is in [include/lob/recording.hpp](include/lob/recording.hpp).
+
+## HFT: the engine as a program
+
+Everything above is a library: to use it, a program has to be written in C++
+and built with it. `hft` is the engine as a program of its own, which any other
+program on the same machine can use by connecting to a socket and sending
+orders. It is how the engine goes inside an application written in something
+else.
+
+```bash
+./build/hft serve --socket /tmp/hft.sock --data ./hft-data
+```
+
+A client connects, says which books to run, and from then on sends orders and
+is told what became of them:
+
+| The client sends | HFT answers |
+|---|---|
+| `Hello`: the books to run | `Welcome` |
+| `Order`: limit, market, IOC or FOK | `Fill` for each trade, then `Accepted`; or `Rejected` |
+| `Cancel` | `Cancelled`, or `CancelRejected` |
+| `Quote`: what the house should bid and offer | nothing, unless it trades with a resting order |
+| `DepthRequest` | `Depth`: the top of the book |
+| `StatsRequest` | `Stats`: the session's statistics, as JSON |
+
+Each message is an 8-byte header and a fixed layout with no padding, set out in
+[hft/wire.hpp](hft/wire.hpp). [hft/node/hft-client.mjs](hft/node/hft-client.mjs)
+is a complete client in Node.js with no dependencies:
+
+```js
+import { HftClient, Side } from './hft/node/hft-client.mjs';
+
+const hft = new HftClient('/tmp/hft.sock');
+await hft.connect();
+await hft.hello([{ symbol: 'AAPL', minPrice: 1, numLevels: 100_000, maxOrders: 16_384 }]);
+
+hft.on('fill', (fill) => console.log(fill.quantity, 'at', fill.price));
+hft.quote(0, [{ price: 22849, quantity: 500 }], [{ price: 22851, quantity: 400 }]);
+hft.order({ tag: 1n, symbol: 0, side: Side.Buy, price: 22851, quantity: 100 });
+```
+
+What HFT adds to the books underneath:
+
+- **The house.** A market needs someone to trade with. A `Quote` says what the
+  market's own bids and offers in a symbol should be, and HFT keeps real orders
+  resting in the book to match, cancelling and placing only what changed.
+  Client orders trade with those, and with each other, in strict price and
+  time order. When the house's prices move through a client's resting order,
+  that order fills at its own price.
+- **Both sides of a trade are told.** The engine reports a trade to whoever
+  sent the incoming order. HFT also tells the owner of the resting order, with
+  how much of it is left, and says whether the other side was the house or
+  another client.
+- **A client cannot touch what is not its own.** The house's orders have IDs
+  like any others; a cancel that names one is refused.
+- **Sessions.** If the client goes away, HFT keeps the books and waits. A
+  client that reconnects finds them as it left them, or asks for a fresh start.
+- **Statistics.** How many orders, cancels and trades, what was refused, and
+  how long each message took: the typical time, and the times that 90%, 99%
+  and 99.9% of messages beat. They are sent on request as JSON, and written
+  every few seconds to `hft-stats.json` and, as a page a person can read, to
+  `hft-stats.txt`.
+- **A recording of every session,** beside its statistics, using the recorder
+  described above. `hft verify` replays one from nothing and prints the
+  fingerprint of what the engine did, which the statistics also carry; if the
+  two are equal, the replay did exactly what the session did:
+
+  ```bash
+  ./build/hft verify hft-data/hft-session-20261010-025141-1.rec 60d4cb6298bf9066
+  ```
+
+HFT is one thread. Each message is turned into commands for the engine, and
+each command is run to completion before the next is sent, so there is no ring
+to cross and no second thread to wake. When nothing is arriving it sleeps,
+using no CPU: it is meant to sit inside a desktop application for days.
+
+### Trying it without a market
+
+`hft simulate` runs HFT against a made-up market: symbols whose prices wander,
+a house quoting ten levels a side, and traders who take that liquidity, rest
+orders around the spread, trade with each other and cancel. It then prints the
+statistics and replays the recording to check it.
+
+```bash
+./build/hft simulate --messages 5000000 --symbols 34 --data ./hft-data
+```
+
+On the laptop described under [Results](#results), five million messages
+across 34 symbols:
+
+| | |
+|---|---|
+| Orders, cancels, house quote updates | 2.6 million, 0.9 million, 1.5 million |
+| Trades | 2.25 million, of which 0.49 million between two clients |
+| Time to handle an order or a cancel | typically 143 ns; 99 in 100 under 600 ns; the slowest, when the machine interrupted it, about 0.1 ms |
+| Time to handle a house quote update | typically 0.8 µs, for about six orders placed or cancelled |
+| Messages a second, simulator included | 1.5 to 1.6 million |
+| Refused, lost or in error | none |
+| Replay of the recording | the same session |
+
+The market is invented. These numbers say how the engine behaves under load,
+and nothing about how any trading strategy would do on a real market.
+
+Things to know:
+
+- **One client at a time,** on a Unix socket, which never leaves the machine.
+  The socket file can be opened only by the user who started HFT.
+- **The client decides the house's prices.** HFT keeps the house's orders in
+  line with the latest `Quote`; it has no view of its own on what a symbol is
+  worth.
+- **The books are fixed by `Hello`.** A different set of books means a new
+  session with empty ones.
+- **A recording stops growing at 1,024 MB** unless told otherwise, and the
+  session carries on unrecorded; the statistics say so, and keep the
+  fingerprint of the recorded part. The five newest sessions are kept and
+  older ones deleted when a new session starts.
+- **Statistics are per session** and measured inside HFT: the time a message
+  spends in the socket on its way in and out is not in them.
 
 ## Build
 
@@ -478,6 +605,7 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/load_by_time_test.cpp](tests/load_by_time_test.cpp) | Timing a sample of commands: expensive commands told from cheap ones, a sample agreeing with timing everything, regular order patterns not fooling the sampling, interruptions capped, and rebalancing by time catching an imbalance that counting commands cannot see. |
 | [tests/market_data_test.cpp](tests/market_data_test.cpp) | Which messages each kind of command produces, snapshots, a slow reader recovering from dropped messages, 6,000 random commands with a mirror checked against the book after every one, and mirrors checked against the books after random traffic and moves across three shard threads. |
 | [tests/replay_test.cpp](tests/replay_test.cpp) | Recording: every command in order, none lost when the writer falls behind, none recorded that the engine refused, files that are cut short, damaged or not recordings at all. Replaying: random sessions of 20,000 commands on a running engine, and on four shards with dozens of moves, reproduced event for event, message for message and order for order on engines of other shapes; stopping part-way; and a recorded replay giving the same file byte for byte. |
+| [tests/hft_test.cpp](tests/hft_test.cpp) | HFT through the messages a client sends: orders, fills told to both sides, cancels, the house following its quotes and never trading with itself, depth, sessions, statistics, the recording cap and the replay check; 30,000 random messages with a client that keeps its own books from what it is told and must end with nothing unaccounted for; and a server on a real socket handling split and batched messages, a client that leaves and returns, and nonsense. [hft/node/smoke.mjs](hft/node/smoke.mjs) drives the built program from Node.js. |
 | [tests/rebalance_test.cpp](tests/rebalance_test.cpp) | The rebalancing decision on its own, including 300 random cases showing that repeated moves only ever improve things and always stop; and the engine moving a busy symbol off an overloaded shard, settling, following a shift in traffic, and doing it all unprompted. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
@@ -617,12 +745,14 @@ machine is; run them on the hardware you care about.
 - [x] Phase 16 — Measuring load by time spent rather than commands handled
 - [x] Phase 17 — A market data feed: best prices, depth and trades
 - [x] Phase 18 — Recording a session to a file and replaying it exactly
+- [x] Phase 19 — HFT: the engine as a program, with a socket, a house, statistics and a Node.js client
 - [ ] Next — Saving the books part-way through, so that a replay need not start from the beginning
 
 ## Layout
 
 ```
 include/lob/   header-only engine
+hft/           HFT: the engine as a program, and its Node.js client
 tests/         GoogleTest suite
 bench/         Google Benchmark suite
 ```

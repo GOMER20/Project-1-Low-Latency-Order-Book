@@ -21,6 +21,7 @@ endif()
 # --- Options -----------------------------------------------------------------
 option(LOB_BUILD_TESTS        "Build the GoogleTest unit tests"            ON)
 option(LOB_BUILD_BENCHMARKS   "Build the Google Benchmark suite"           ON)
+option(LOB_BUILD_HFT          "Build HFT, the engine as a program"         ON)
 option(LOB_NATIVE_ARCH        "Tune for the host CPU (-march=native)"      ON)
 option(LOB_ENABLE_LTO         "Link-time optimisation in Release builds"   ON)
 option(LOB_ENABLE_SANITIZERS  "Build with ASan + UBSan (use with Debug)"   OFF)
@@ -94,6 +95,14 @@ endfunction()
 include(FetchContent)
 find_package(Threads REQUIRED)
 
+# --- HFT ---------------------------------------------------------------------
+# The engine as a program of its own: another program connects to its socket
+# and sends it orders. Its sources include each other as "hft/...".
+if(LOB_BUILD_HFT)
+  lob_add_executable(hft hft/main.cpp)
+  target_include_directories(hft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 # --- Tests -------------------------------------------------------------------
 if(LOB_BUILD_TESTS)
   find_package(GTest CONFIG QUIET)
@@ -131,12 +140,25 @@ if(LOB_BUILD_TESTS)
     tests/rebalance_test.cpp
     tests/load_by_time_test.cpp
     tests/market_data_test.cpp
-    tests/replay_test.cpp)
+    tests/replay_test.cpp
+    tests/hft_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
+  target_include_directories(lob_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   # Listing the tests runs the binary at build time. The default limit of 5
   # seconds is too tight for a sanitizer build on a busy machine.
   # The per-test limit turns a hang into a failure instead of a stalled run.
   gtest_discover_tests(lob_tests DISCOVERY_TIMEOUT 120 PROPERTIES TIMEOUT 300)
+
+  # Drives the hft program from Node.js, if Node is installed: what a client
+  # written in another language would do, starting from the real binary.
+  if(LOB_BUILD_HFT)
+    find_program(LOB_NODE node)
+    if(LOB_NODE)
+      add_test(NAME HftNode.DrivesTheProgramFromAnotherLanguage
+        COMMAND ${LOB_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/hft/node/smoke.mjs $<TARGET_FILE:hft>)
+      set_tests_properties(HftNode.DrivesTheProgramFromAnotherLanguage PROPERTIES TIMEOUT 120)
+    endif()
+  endif()
 
   # This test replaces global operator new to count allocations. Sanitizer
   # runtimes replace operator new too, and the two cannot share a binary, so

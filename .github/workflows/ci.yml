@@ -93,3 +93,10 @@ jobs:
         if: matrix.build_type == 'Release'
         timeout-minutes: 5
         run: ./build/lob_bench --benchmark_min_time=0.01s
+
+      # HFT on a made-up market, in every kind of build: it prints its
+      # statistics, replays its own recording, and fails if the replay differs
+      # or anything was refused in error.
+      - name: Run HFT on a simulated market
+        timeout-minutes: 5
+        run: ./build/hft simulate --messages 200000 --symbols 8 --data "$RUNNER_TEMP"

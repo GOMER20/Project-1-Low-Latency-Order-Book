@@ -56,6 +56,12 @@ struct EngineConfig {
   // How many commands may be waiting to be written to that file before the
   // engine starts refusing new ones; rounded up to a power of two.
   std::size_t recording_capacity = 1 << 16;
+
+  // Stop recording after this many commands; 0, the default, never stops. The
+  // file then holds the start of the session and replays as the session up to
+  // that point. For an engine left running for days, whose recording would
+  // otherwise grow until the disk was full: a command is 32 bytes.
+  std::uint64_t recording_limit = 0;
 };
 
 // Decides how much of one timed command to count, and keeps `typical_x256` up
@@ -170,8 +176,8 @@ class MatchingEngine {
       books_[symbol] = owned_.back().get();
     }
     if (!config.record_to.empty()) {
-      own_recorder_ = std::make_unique<SessionRecorder>(config.record_to, config.books,
-                                                        config.recording_capacity);
+      own_recorder_ = std::make_unique<SessionRecorder>(
+          config.record_to, config.books, config.recording_capacity, config.recording_limit);
       recorder_ = own_recorder_.get();
     }
   }
@@ -364,6 +370,12 @@ class MatchingEngine {
   // until flush_recording() returns.
   [[nodiscard]] std::uint64_t commands_recorded() const noexcept {
     return recorder_ != nullptr ? recorder_->written() : 0;
+  }
+
+  // Whether the recording has reached EngineConfig::recording_limit and
+  // stopped. Up to date once flush_recording() has returned.
+  [[nodiscard]] bool recording_at_limit() const noexcept {
+    return recorder_ != nullptr && recorder_->at_limit();
   }
 
   // --- Publisher thread ------------------------------------------------------
