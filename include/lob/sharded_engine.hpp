@@ -66,6 +66,7 @@ struct ShardedConfig {
   // the moves. Turn this on only if one thread feeds every shard.
   std::string record_to = {};
   std::size_t recording_capacity = 1 << 16;  // see EngineConfig::recording_capacity
+  std::uint64_t recording_limit = 0;         // see EngineConfig::recording_limit
 };
 
 // What became of a command handed to a ShardedEngine.
@@ -167,8 +168,8 @@ class ShardedEngine {
     balance_.carried.assign(shard_count, 0);
 
     if (!config.record_to.empty()) {
-      recorder_ = std::make_unique<SessionRecorder>(config.record_to, config.books,
-                                                    config.recording_capacity);
+      recorder_ = std::make_unique<SessionRecorder>(
+          config.record_to, config.books, config.recording_capacity, config.recording_limit);
     }
 
     shards_.reserve(shard_count);
@@ -481,6 +482,10 @@ class ShardedEngine {
   // Commands and moves written to the recording so far.
   [[nodiscard]] std::uint64_t commands_recorded() const noexcept {
     return recorder_ != nullptr ? recorder_->written() : 0;
+  }
+
+  [[nodiscard]] bool recording_at_limit() const noexcept {
+    return recorder_ != nullptr && recorder_->at_limit();
   }
 
   // --- Publisher threads -----------------------------------------------------

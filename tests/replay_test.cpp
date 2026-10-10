@@ -663,6 +663,90 @@ TEST(Recorder, UsedOnItsOwnWritesOutWhatIsLeftWhenItIsDestroyed) {
   }
 }
 
+TEST(Recorder, StopsAtItsLimitAndWhatItHasReplaysAsTheSessionSoFar) {
+  // Limits either side of the 1,024 commands the writer hands over at a time,
+  // and one that the session never reaches.
+  for (const std::uint64_t limit : {std::uint64_t{1}, std::uint64_t{100}, std::uint64_t{1'024},
+                                    std::uint64_t{1'500}, std::uint64_t{5'000}}) {
+    constexpr std::uint64_t kCommands = 3'000;
+    const TempFile file("_" + std::to_string(limit));
+    std::vector<Event> live;
+    std::vector<std::size_t> events_after;  // how many events there had been after each command
+    {
+      MatchingEngine engine(
+          {.books = make_books(1), .record_to = file.path(), .recording_limit = limit});
+      for (std::uint64_t tag = 0; tag < kCommands; ++tag) {
+        // Each sell fills the buy before it: two commands, three events.
+        while (!engine.submit(tag, 0, tag % 2 == 0 ? Side::Buy : Side::Sell, 1'020, 1)) {
+          engine.process_pending();
+          engine.poll([&](const Event& event) { live.push_back(event); });
+        }
+        engine.process_pending();
+        engine.poll([&](const Event& event) { live.push_back(event); });
+        events_after.push_back(live.size());
+      }
+      engine.flush_recording();
+      const std::uint64_t expected = std::min(limit, kCommands);
+      EXPECT_EQ(engine.commands_recorded(), expected) << "limit " << limit;
+      EXPECT_EQ(engine.recording_at_limit(), limit <= kCommands) << "limit " << limit;
+      EXPECT_TRUE(engine.recording());  // the file is good; it is just finished
+    }
+
+    const std::optional<Recording> recording = Recording::load(file.path());
+    ASSERT_TRUE(recording.has_value());
+    EXPECT_FALSE(recording->damaged());
+    const std::uint64_t expected = std::min(limit, kCommands);
+    ASSERT_EQ(recording->commands().size(), expected) << "limit " << limit;
+    for (std::uint64_t index = 0; index < expected; ++index) {
+      ASSERT_EQ(recording->commands()[index].client_tag, index);
+    }
+
+    MatchingEngine again({.books = recording->books()});
+    std::vector<Event> replayed;
+    lob::replay(recording->commands(), again,
+                [&](const Event& event) { replayed.push_back(event); });
+    const std::vector<Event> so_far(
+        live.begin(), live.begin() + static_cast<std::ptrdiff_t>(events_after[expected - 1]));
+    expect_same_events(so_far, replayed, "limit " + std::to_string(limit));
+  }
+}
+
+TEST(Recorder, ALimitOfNoneNeverStops) {
+  const TempFile file;
+  MatchingEngine engine({.books = make_books(1), .record_to = file.path()});
+  for (std::uint64_t tag = 0; tag < 5'000; ++tag) {
+    while (!engine.submit(tag, 0, Side::Buy, 1'020, 1, OrderType::IOC)) {
+      engine.process_pending();
+      engine.poll([](const Event&) {});
+    }
+    engine.process_pending();
+    engine.poll([](const Event&) {});
+  }
+  engine.flush_recording();
+  EXPECT_EQ(engine.commands_recorded(), 5'000u);
+  EXPECT_FALSE(engine.recording_at_limit());
+  EXPECT_FALSE(MatchingEngine({.books = make_books(1)}).recording_at_limit());  // not recording at all
+}
+
+TEST(ShardedRecorder, StopsAtItsLimitToo) {
+  const TempFile file;
+  ShardedEngine engine({.books = make_books(4),
+                        .shards = 2,
+                        .record_to = file.path(),
+                        .recording_limit = 10});
+  for (std::uint64_t tag = 0; tag < 40; ++tag) {
+    ASSERT_EQ(engine.submit(tag, static_cast<SymbolId>(tag % 4), Side::Buy, 1'020 + 100 * static_cast<Price>(tag % 4), 1,
+                            OrderType::IOC),
+              SendStatus::Sent);
+    engine.process_pending();
+    engine.poll([](const Event&) {});
+  }
+  engine.flush_recording();
+  EXPECT_EQ(engine.commands_recorded(), 10u);
+  EXPECT_TRUE(engine.recording_at_limit());
+  EXPECT_EQ(Recording::load(file.path())->commands().size(), 10u);
+}
+
 TEST(Recorder, IsOffUnlessAFileIsNamed) {
   MatchingEngine engine({.books = make_books(1)});
   EXPECT_FALSE(engine.recording());

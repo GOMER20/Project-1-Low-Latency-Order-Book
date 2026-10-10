@@ -151,9 +151,17 @@ class SessionRecorder {
  public:
   // Opens the file and writes the header and the books. If that fails the
   // recorder still accepts commands, and throws them away; check ok().
+  //
+  // `limit` is the most commands to write, or 0 for no limit. A recording
+  // that reaches its limit stops there: the file is the session's first
+  // `limit` commands, which replays as the session up to that point. It is
+  // there so that a program left running for days cannot fill the disk.
   SessionRecorder(const std::string& path, std::span<const BookConfig> books,
-                  std::size_t capacity)
-      : ring_(capacity), buffer_(kFileBufferSize), file_(std::fopen(path.c_str(), "wb")) {
+                  std::size_t capacity, std::uint64_t limit = 0)
+      : ring_(capacity),
+        buffer_(kFileBufferSize),
+        file_(std::fopen(path.c_str(), "wb")),
+        limit_(limit) {
     bool good = file_ != nullptr;
     if (good) {
       // A buffer of our own, so that the size of each write to the operating
@@ -228,9 +236,15 @@ class SessionRecorder {
   [[nodiscard]] bool ok() const noexcept { return ok_.load(std::memory_order_acquire); }
 
   // Commands written so far. It trails what has been recorded until flush()
-  // returns.
+  // returns, and never passes the limit.
   [[nodiscard]] std::uint64_t written() const noexcept {
     return written_.load(std::memory_order_acquire);
+  }
+
+  // True once the limit has been reached and commands are no longer being
+  // written. Like written(), it is up to date once flush() has returned.
+  [[nodiscard]] bool at_limit() const noexcept {
+    return limit_ != 0 && written_.load(std::memory_order_acquire) >= limit_;
   }
 
  private:
@@ -255,10 +269,15 @@ class SessionRecorder {
       std::uint64_t wrote = 0;
       std::size_t waiting = 0;
       const auto write_block = [&] {
-        if (waiting != 0 && ok_.load(std::memory_order_relaxed)) {
-          const std::size_t done = std::fwrite(block_.data(), sizeof(RecordedCommand), waiting, file_);
+        // Up to the limit and no further: what comes after is let go.
+        const std::uint64_t so_far = written_.load(std::memory_order_relaxed) + wrote;
+        const std::size_t wanted =
+            limit_ == 0 ? waiting
+                        : static_cast<std::size_t>(std::min<std::uint64_t>(waiting, limit_ - so_far));
+        if (wanted != 0 && ok_.load(std::memory_order_relaxed)) {
+          const std::size_t done = std::fwrite(block_.data(), sizeof(RecordedCommand), wanted, file_);
           wrote += done;
-          if (done != waiting) {
+          if (done != wanted) {
             ok_.store(false, std::memory_order_release);
           }
         }
@@ -315,6 +334,7 @@ class SessionRecorder {
   SpscRing<Command> ring_;
   std::vector<char> buffer_;  // the file's buffer; must outlive the file being open
   std::FILE* file_;           // after construction, used only by the writer thread
+  const std::uint64_t limit_;  // most commands to write; 0 for no limit
   std::array<RecordedCommand, kBlock> block_{};  // used only by the writer thread
 
   alignas(kCacheLineSize) std::atomic<bool> ok_{false};
